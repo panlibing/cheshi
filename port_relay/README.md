@@ -170,7 +170,7 @@ CXX=clang++ bash port_relay/tests/run_tests.sh     # 指定编译器
 - **B) 启动写法** —— 位置写法 / 命名参数（含 `--key=value`）/ `--rule`（可重复）/ `-f` 配置文件
 - **C) 默认配置** —— 不带参数启动时自动加载可执行文件同目录的 `portrelay.conf`
 - **D) 帮助与错误分支** —— `-h` / `-V` 输出；非法 mode、端口越界、坏规则串、配置文件不存在等必须被拒绝并给出可读错误
-- **E) 文档同步** —— README 与 `-h` 的长选项集合双向比对
+- **E) 文档同步** —— README 与 `-h` 的长选项集合双向比对，并校验文件树里的行数标注（源码行数变了而文档没跟，直接失败）
 
 只做文档同步检查（不需要编译器，直接用已构建的二进制）：
 
@@ -190,24 +190,33 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_args_tests.ps1
 
 ### 持续集成
 
-`.github/workflows/port_relay-ci.yml` 在 `ubuntu-latest` / `windows-latest` /
-`macos-latest` 上编译并执行自测（Linux/macOS 跑 `tests/run_tests.sh`，
-Windows 跑 PowerShell 自测并附加 MSVC 构建检查）。
+`.github/workflows/port_relay-ci.yml` 在三个平台都真正拉起仓库自带的脚本
+（脚本是唯一事实来源，CI 不重复手写编译命令）：
+
+| 作业 | 平台 | 内容 |
+|---|---|---|
+| `linux-build-test` | `ubuntu-latest` × {g++, clang++} | `bash build.sh` → `tests/check_docs_sync.sh` → `tests/run_tests.sh`（A~E 全部分段） |
+| `macos-build-test` | `macos-latest`（clang++） | 同上 |
+| `windows-build-test` | `windows-latest`（MSVC） | `build.bat` + `tests\build.bat` → `check_docs_sync.sh`（Git Bash）→ `run_tests.ps1` → `run_args_tests.ps1` |
+
+每个作业编译前先对所有 shell 脚本做 `bash -n` 语法检查；三平台都会执行
+`tests/check_docs_sync.sh`，因此 README 的长选项集合或文件树行数标注一旦与源码
+漂移，CI 立刻失败。失败时还会 `ls -l` 打印产物信息便于定位。
 
 ## 文件
 
 ```
 port_relay/
-├─ portrelay.cpp            主程序(单文件, 1166 行)
+├─ portrelay.cpp            主程序(单文件, 1265 行)
 ├─ build.bat                Windows MSVC 构建脚本
 ├─ build.sh                 Linux/macOS 构建脚本
 ├─ README.md                本说明
 └─ tests/
    ├─ echo.cpp              自测用 TCP/UDP 回声服务器(88 行)
-   ├─ probe.cpp             跨平台自测客户端探针(231 行)
+   ├─ probe.cpp             跨平台自测客户端探针(233 行)
    ├─ build.bat             tests 下辅助程序的构建脚本
-   ├─ run_tests.sh          端到端自测: Linux/macOS/CI(231 行)
-   ├─ check_docs_sync.sh    README 与 -h 长选项双向一致性检查(59 行)
+   ├─ run_tests.sh          端到端自测: Linux/macOS/CI(236 行)
+   ├─ check_docs_sync.sh    README 与 -h 选项/行数标注一致性检查(88 行)
    ├─ run_tests.ps1         Windows 端到端自测(PowerShell)
    ├─ run_args_tests.ps1    Windows 参数/错误分支自测(PowerShell)
    ├─ diag.ps1              Windows 快速诊断(PowerShell)

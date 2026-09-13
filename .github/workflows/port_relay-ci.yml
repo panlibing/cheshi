@@ -16,6 +16,10 @@ permissions:
   contents: read
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Linux: g++ / clang++ 双编译器, 直接跑仓库自带的 build.sh / run_tests.sh /
+  #        check_docs_sync.sh (不重复手写编译命令, 脚本就是唯一事实来源)
+  # ---------------------------------------------------------------------------
   linux-build-test:
     name: Linux 构建 + 端到端自测 (${{ matrix.cxx }})
     runs-on: ubuntu-latest
@@ -35,21 +39,22 @@ jobs:
           $CXX --version | head -n 1
           bash --version | head -n 1
 
+      - name: shell 脚本语法检查 (bash -n)
+        working-directory: port_relay
+        run: |
+          for f in build.sh tests/run_tests.sh tests/check_docs_sync.sh; do
+            bash -n "$f" && echo "  - $f 语法 OK"
+          done
+
       - name: 构建 portrelay (bash build.sh)
         working-directory: port_relay
         run: bash build.sh
 
-      - name: 构建自测用 echo / probe
-        working-directory: port_relay/tests
-        run: |
-          $CXX -std=c++17 -O2 -Wall -Wextra -pthread -o echo  echo.cpp
-          $CXX -std=c++17 -O2 -Wall -Wextra -pthread -o probe probe.cpp
-
-      - name: 语法检查 (bash -n)
+      - name: 文档同步检查 (tests/check_docs_sync.sh)
         working-directory: port_relay
-        run: bash -n tests/run_tests.sh && echo 'run_tests.sh 语法 OK'
+        run: bash tests/check_docs_sync.sh
 
-      - name: Linux 端到端自测 (bash tests/run_tests.sh)
+      - name: 端到端自测 (tests/run_tests.sh: 内含构建 + A~E 全部分段)
         working-directory: port_relay
         run: bash tests/run_tests.sh
 
@@ -57,3 +62,96 @@ jobs:
         if: failure()
         working-directory: port_relay
         run: ls -l portrelay tests/echo tests/probe 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # macOS: clang++, 同样跑仓库脚本(此前 CI 里根本没有 macOS 任务)
+  # ---------------------------------------------------------------------------
+  macos-build-test:
+    name: macOS 构建 + 端到端自测 (clang++)
+    runs-on: macos-latest
+    env:
+      CXX: clang++
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 工具链版本
+        run: |
+          $CXX --version | head -n 1
+          bash --version | head -n 1
+
+      - name: shell 脚本语法检查 (bash -n)
+        working-directory: port_relay
+        run: |
+          for f in build.sh tests/run_tests.sh tests/check_docs_sync.sh; do
+            bash -n "$f" && echo "  - $f 语法 OK"
+          done
+
+      - name: 构建 portrelay (bash build.sh)
+        working-directory: port_relay
+        run: bash build.sh
+
+      - name: 文档同步检查 (tests/check_docs_sync.sh)
+        working-directory: port_relay
+        run: bash tests/check_docs_sync.sh
+
+      - name: 端到端自测 (tests/run_tests.sh: 内含构建 + A~E 全部分段)
+        working-directory: port_relay
+        run: bash tests/run_tests.sh
+
+      - name: 失败时打印产物信息
+        if: failure()
+        working-directory: port_relay
+        run: ls -l portrelay tests/echo tests/probe 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # Windows: MSVC(build.bat 自动定位 VS 环境) + 两个 PowerShell 自测脚本
+  #          + Git Bash 跑文档同步检查(三平台都验证文档不漂移)
+  # ---------------------------------------------------------------------------
+  windows-build-test:
+    name: Windows 构建 + 自测 (MSVC + PowerShell)
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 构建 portrelay.exe (build.bat, MSVC)
+        working-directory: port_relay
+        shell: cmd
+        run: build.bat
+
+      - name: 构建 tests\echo.exe (tests\build.bat, MSVC)
+        working-directory: port_relay\tests
+        shell: cmd
+        run: build.bat
+
+      - name: shell 脚本语法检查 (bash -n, Git Bash)
+        working-directory: port_relay
+        shell: bash
+        run: |
+          for f in build.sh tests/run_tests.sh tests/check_docs_sync.sh; do
+            bash -n "$f" && echo "  - $f 语法 OK"
+          done
+
+      - name: 文档同步检查 (tests/check_docs_sync.sh, Git Bash)
+        working-directory: port_relay
+        shell: bash
+        run: bash tests/check_docs_sync.sh portrelay.exe
+
+      - name: Windows 端到端自测 (tests/run_tests.ps1)
+        working-directory: port_relay
+        shell: pwsh
+        run: ./tests/run_tests.ps1
+
+      - name: Windows 参数/错误分支自测 (tests/run_args_tests.ps1)
+        working-directory: port_relay
+        shell: pwsh
+        run: ./tests/run_args_tests.ps1
+
+      - name: 失败时打印产物信息
+        if: failure()
+        working-directory: port_relay
+        shell: bash
+        run: ls -l portrelay.exe tests/echo.exe 2>/dev/null || true
