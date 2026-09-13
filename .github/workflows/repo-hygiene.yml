@@ -1,0 +1,49 @@
+name: repo hygiene
+
+# 仓库卫生兜底检查: 防止构建产物 / 本机临时文件被提交进仓库
+#
+#   pre-commit 钩子(.githooks/pre-commit)是「提交前」的第一道防线, 但它依赖
+#   `git config core.hooksPath .githooks` 本机配置, 且能被 --no-verify 绕过;
+#   本工作流是「合并前」的第二道防线, 检查的是仓库中「已被跟踪」的文件。
+#
+#   与 port_relay-ci.yml 的分工: 那个管子构建与端到端自测, 这个只管仓库卫生,
+#   故意不加 paths 过滤, 任何推送都会检查整个仓库。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-garbage-files:
+    name: 禁止提交构建产物与临时文件
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 扫描已被 git 跟踪的构建产物
+        run: |
+          set -eu
+          bad=$(git ls-files | grep -E '\.(exe|obj|pdb|ilk|exp|lib|dll|o|a|so|dylib)$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::仓库中混入了构建产物。处理: git rm --cached <文件> 并确认 .gitignore 已覆盖。"
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+          echo "构建产物检查通过"
+
+      - name: 扫描本机临时文件
+        run: |
+          set -eu
+          junk=$(git ls-files | grep -E '(^|/)_localdev/|\.log$|\.(tmp|bak|orig|rej)$' || true)
+          if [ -n "$junk" ]; then
+            echo "::error::仓库中混入了本机临时文件/调试脚手架。处理: git rm --cached <文件>, 脚手架请放 _localdev/ 并保持被忽略。"
+            printf '%s\n' "$junk"
+            exit 1
+          fi
+          echo "临时文件检查通过"

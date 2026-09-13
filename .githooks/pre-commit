@@ -1,0 +1,97 @@
+#!/bin/sh
+# ============================================================================
+# pre-commit 守卫: 提交前拦截「本不该入库」的文件
+#
+#   检查三类问题:
+#     1) 构建产物   : *.exe *.obj *.pdb *.dll *.lib *.so *.o *.a ... 等二进制
+#     2) 忽略规则命 : 新增文件仍被 .gitignore 匹配(说明它是本机临时文件,
+#                     能进暂存区通常是因为用了 git add -f / git add .)
+#     3) 超大文件   : 单个文件超过 BIG_LIMIT_BYTES(默认 5 MiB)
+#
+#   安装(每个克隆只需做一次):
+#       git config core.hooksPath .githooks
+#
+#   确认确实要提交二进制/大文件时临时绕过:
+#       git commit --no-verify
+#   调整大文件阈值:
+#       BIG_LIMIT_BYTES=10485760 git commit -m '...'
+# ============================================================================
+set -u
+
+BIG_LIMIT_BYTES=${BIG_LIMIT_BYTES:-5242880}
+GIT_CMD="git -c core.quotepath=false"
+
+# 暂存区里「新增/修改/复制」的文件
+changed=$($GIT_CMD diff --cached --name-only --diff-filter=ACM)
+[ -z "$changed" ] && exit 0
+# 仅新增文件(用于判断是否命中 .gitignore)
+added=$($GIT_CMD diff --cached --name-only --diff-filter=A)
+
+artifact_hits=""
+ignored_hits=""
+big_hits=""
+
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+
+    # --- 1) 构建产物扩展名 ---
+    case "$f" in
+        *.exe|*.obj|*.pdb|*.ilk|*.exp|*.lib|*.dll|*.o|*.a|*.so|*.so.*|*.dylib)
+            artifact_hits="$artifact_hits  - $f
+"
+            ;;
+    esac
+
+    # --- 3) 超大文件 ---
+    if [ -f "$f" ]; then
+        size=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+        if [ -n "$size" ] && [ "$size" -gt "$BIG_LIMIT_BYTES" ]; then
+            big_hits="$big_hits  - $f ($((size / 1048576)) MiB)
+"
+        fi
+    fi
+done <<EOF
+$changed
+EOF
+
+# --- 2) 新增文件命中 .gitignore ---
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    # --no-index: 文件已被 git add 进索引时默认跳过检查, 这里必须强制查规则
+    if $GIT_CMD check-ignore -q --no-index -- "$f"; then
+        rule=$($GIT_CMD check-ignore -v --no-index -- "$f" | sed -E 's/^[^:]*:[0-9]*:([^	]*).*/\1/')
+        ignored_hits="$ignored_hits  - $f  (命中规则: $rule)
+"
+    fi
+done <<EOF
+$added
+EOF
+
+if [ -n "$artifact_hits" ] || [ -n "$ignored_hits" ] || [ -n "$big_hits" ]; then
+    {
+        echo "=============================================================="
+        echo "  [pre-commit] 已阻止本次提交: 检测到疑似误提交内容"
+        echo "=============================================================="
+        if [ -n "$artifact_hits" ]; then
+            echo "[构建产物] 编译生成的二进制不应入库:"
+            printf '%s' "$artifact_hits"
+        fi
+        if [ -n "$ignored_hits" ]; then
+            echo "[命中忽略规则] 这些新增文件被 .gitignore 排除, 属本机临时文件:"
+            printf '%s' "$ignored_hits"
+        fi
+        if [ -n "$big_hits" ]; then
+            echo "[超大文件] 超过 $(($BIG_LIMIT_BYTES / 1048576)) MiB:"
+            printf '%s' "$big_hits"
+        fi
+        echo "--------------------------------------------------------------"
+        echo "处理办法:"
+        echo "  1) 从暂存区撤下   : git restore --staged <文件>"
+        echo "  2) 若之前已入库   : git rm --cached <文件>  然后提交"
+        echo "  3) 确认确实要提交 : git commit --no-verify"
+        echo "=============================================================="
+    } >&2
+    exit 1
+fi
+
+exit 0

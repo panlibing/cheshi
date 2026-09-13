@@ -2,7 +2,7 @@
 # 换行符策略: 保证 shell 脚本在 Linux/CI 检出后一定是 LF
 #   (Windows 本地因 core.autocrlf=true 会把工作区文件转成 CRLF, 若把 CRLF 的
 #    .sh 提交进仓库, Linux 上会报 "bad interpreter: /bin/bash^M"; 反之把 CRLF
-#    的脚本留在工作区, Git Bash 里也会出现 $'\r' 报错)
+#    的脚本留在工作区, Git Bash 里也会出现回车字符导致的报错)
 # ============================================================================
 
 * text=auto
@@ -14,6 +14,11 @@
 *.yaml        text eol=lf
 Makefile      text eol=lf
 build.sh      text eol=lf
+
+# Git 钩子: 由 sh 执行, 必须强制 LF
+#   (Windows 下 autocrlf=true 会把无扩展名的 pre-commit 检出成 CRLF,
+#    执行时报 bad interpreter 或回车字符相关错误; 钉成 LF 才稳)
+.githooks/*   text eol=lf
 
 # Windows 脚本: 强制 CRLF
 *.bat         text eol=crlf
