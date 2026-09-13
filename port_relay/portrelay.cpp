@@ -64,6 +64,9 @@
   #define E_WOULDBLOCK  WSAEWOULDBLOCK
   #define E_CONNRESET   WSAECONNRESET
   #define E_INTR        WSAEINTR
+  #define E_MFILE       WSAEMFILE
+  #define E_NOBUFS      WSAENOBUFS
+  #define E_CONNABORT   WSAECONNABORTED
   #define SHUT_SEND     SD_SEND
   inline int closesock(sock_t s) { return closesocket(s); }
   inline bool set_nonblock(sock_t s) { u_long m = 1; return ioctlsocket(s, FIONBIO, &m) == 0; }
@@ -85,6 +88,9 @@
   #define E_WOULDBLOCK  EWOULDBLOCK
   #define E_CONNRESET   ECONNRESET
   #define E_INTR        EINTR
+  #define E_MFILE       EMFILE
+  #define E_NOBUFS      ENOBUFS
+  #define E_CONNABORT   ECONNABORTED
   #define SHUT_SEND     SHUT_WR
   inline int closesock(sock_t s) { return ::close(s); }
   inline bool set_nonblock(sock_t s) {
@@ -257,16 +263,51 @@ static sock_t create_listener(const Options& o, int socktype, std::string& err) 
 }
 
 // ----------------------------------------------------------------------------
-// TCP: 每连接透传(阻塞 select + 半关闭传播)
+// TCP: 每连接透传(poll + 阻塞收发 + 半关闭传播)
 // ----------------------------------------------------------------------------
+// 发送侧必须抑制 SIGPIPE: 对端已关闭时 send 会触发 SIGPIPE, 其默认动作是直接
+// 终止整个转发进程(Linux/macOS 都是), 一条连接的正常断开会演变成服务整体退出。
+//   - Linux:  send() 带 MSG_NOSIGNAL 按次抑制;
+//   - macOS/BSD: 没有 MSG_NOSIGNAL, 用 SO_NOSIGPIPE 套接字选项抑制;
+//   - Windows: 无 SIGPIPE, 下面两处均为空实现。
+#ifndef MSG_NOSIGNAL
+  #define MSG_NOSIGNAL 0
+#endif
+
+static void set_nosigpipe(sock_t s) {
+#ifdef SO_NOSIGPIPE
+  int one = 1;
+  setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (const char*)&one, sizeof(one));
+#else
+  (void)s;
+#endif
+}
+
+// 显式把套接字置回阻塞模式。
+// Windows 上 accept() 出来的套接字会继承"监听套接字"的非阻塞属性(Linux 不继承),
+// 不复位的话正常的 EWOULDBLOCK 会被当成致命错误处理, 大流量时连接会被误断。
+static bool set_blocking(sock_t s) {
+#ifdef _WIN32
+  u_long mode = 0;
+  return ioctlsocket(s, FIONBIO, &mode) == 0;
+#else
+  int fl = fcntl(s, F_GETFL, 0);
+  return fl >= 0 && fcntl(s, F_SETFL, fl & ~O_NONBLOCK) == 0;
+#endif
+}
+
 static bool send_all(sock_t s, const char* data, size_t n) {
   while (n > 0) {
     int chunk = (int)std::min<size_t>(n, (size_t)INT_MAX);
-    int w = (int)send(s, data, chunk, 0);
+    int w = (int)send(s, data, chunk, MSG_NOSIGNAL);
     if (w > 0) { data += w; n -= (size_t)w; continue; }
     if (w < 0) {
       int e = SOCK_ERRNO();
-      if (e == E_INTR) continue;
+      if (e == E_INTR) continue;         // 被信号打断: 重试本段
+      if (e == E_WOULDBLOCK) {           // 非阻塞兜底(正常为阻塞套接字): 短暂退避后重试
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
       return false;   // 连接被重置等
     }
     return false;
@@ -277,79 +318,102 @@ static bool send_all(sock_t s, const char* data, size_t n) {
 static void tcp_worker(sock_t c, const Options& o, const std::vector<AddrInfo>& targets) {
   g_active_tcp.fetch_add(1);
 
-  // 连接目标(依次尝试解析出的各地址)
+  // 客户端套接字显式复位为阻塞模式并抑制 SIGPIPE
+  set_blocking(c);
+  set_nosigpipe(c);
+
+  // u 在 try 之外声明: catch 里需要根据它判断上游套接字是否已建立, 避免重复关闭
   sock_t u = kInvalid;
-  for (const AddrInfo& ai : targets) {
-    u = make_socket(ai.family, SOCK_STREAM);
-    if (u == kInvalid) continue;
-    if (connect(u, (const sockaddr*)&ai.sa, ai.len) == 0) break;
+  try {
+    // 连接目标(依次尝试解析出的各地址)
+    for (const AddrInfo& ai : targets) {
+      u = make_socket(ai.family, SOCK_STREAM);
+      if (u == kInvalid) continue;
+      if (connect(u, (const sockaddr*)&ai.sa, ai.len) == 0) break;
+      closesock(u);
+      u = kInvalid;
+    }
+    if (u == kInvalid) {
+      logv(o, "tcp: upstream connect to %s:%d failed (%s)",
+           o.target_host.c_str(), o.target_port, sockerr_str().c_str());
+      closesock(c);
+      c = kInvalid;
+      g_active_tcp.fetch_sub(1);
+      return;
+    }
+    set_blocking(u);
+    set_nosigpipe(u);
+
+    set_sockbufs(c, o.sockbuf_kb * 1024);
+    set_sockbufs(u, o.sockbuf_kb * 1024);
+    set_nodelay(c);
+    set_nodelay(u);
+
+    logv(o, "tcp: new connection relay started");
+    const size_t chunk = std::min<size_t>((size_t)o.sockbuf_kb * 1024, 65536);
+    std::vector<char> bA(chunk), bB(chunk);
+    bool eofC = false, eofU = false;   // C=客户端 EOF, U=上游 EOF
+
+    while (!(eofC && eofU)) {
+      // 用 poll 取代 select: 单连接下无性能差异, 但彻底规避 fd_set 的
+      // FD_SETSIZE 限制(句柄号 >= FD_SETSIZE 时 FD_SET/FD_ISSET 会越界写内存)。
+      pollfd pf[2] = { { c, POLLIN, 0 }, { u, POLLIN, 0 } };
+      int sel = xpoll(pf, 2, -1);
+      if (sel < 0) {
+        if (SOCK_ERRNO() == E_INTR) continue;
+        break;
+      }
+      if (sel == 0) continue;
+
+      bool rc = (!eofC) && (pf[0].revents & (POLLIN | POLLERR | POLLHUP));
+      bool ru = (!eofU) && (pf[1].revents & (POLLIN | POLLERR | POLLHUP));
+
+      if (rc) {
+        int n = (int)recv(c, bA.data(), (int)bA.size(), 0);
+        if (n > 0) {
+          if (!send_all(u, bA.data(), (size_t)n)) break;   // 上游已断
+        } else if (n == 0) {
+          eofC = true;
+          shutdown(u, SHUT_SEND);          // 向目标传播 EOF(半关闭)
+        } else {
+          int e = SOCK_ERRNO();
+          if (e == E_INTR || e == E_WOULDBLOCK) continue;  // 信号打断/虚假可读: 忽略本次
+          if (e == E_CONNRESET || e == E_CONNABORT) { eofC = true; shutdown(u, SHUT_SEND); }
+          else break;
+        }
+      }
+      if (ru) {
+        int n = (int)recv(u, bB.data(), (int)bB.size(), 0);
+        if (n > 0) {
+          if (!send_all(c, bB.data(), (size_t)n)) break;   // 客户端已断
+        } else if (n == 0) {
+          eofU = true;
+          shutdown(c, SHUT_SEND);          // 向客户端传播 EOF
+        } else {
+          int e = SOCK_ERRNO();
+          if (e == E_INTR || e == E_WOULDBLOCK) continue;  // 信号打断/虚假可读: 忽略本次
+          if (e == E_CONNRESET || e == E_CONNABORT) { eofU = true; shutdown(c, SHUT_SEND); }
+          else break;
+        }
+      }
+    }
     closesock(u);
     u = kInvalid;
-  }
-  if (u == kInvalid) {
-    logv(o, "tcp: upstream connect to %s:%d failed (%s)",
-         o.target_host.c_str(), o.target_port, sockerr_str().c_str());
     closesock(c);
-    g_active_tcp.fetch_sub(1);
-    return;
+    c = kInvalid;
+    logv(o, "tcp: connection closed");
+  } catch (const std::exception& ex) {
+    // 线程函数里逃逸的异常会直接 std::terminate 掉整个进程, 必须就地兜住;
+    // 同时保证套接字与连接计数不泄漏。
+    logline("warning: tcp: connection aborted: %s", ex.what());
+    if (u != kInvalid) closesock(u);
+    if (c != kInvalid) closesock(c);
+  } catch (...) {
+    logline("warning: tcp: connection aborted (unknown exception)");
+    if (u != kInvalid) closesock(u);
+    if (c != kInvalid) closesock(c);
   }
-
-  set_sockbufs(c, o.sockbuf_kb * 1024);
-  set_sockbufs(u, o.sockbuf_kb * 1024);
-  set_nodelay(c);
-  set_nodelay(u);
-
-  logv(o, "tcp: new connection relay started");
-  const size_t chunk = std::min<size_t>((size_t)o.sockbuf_kb * 1024, 65536);
-  std::vector<char> bA(chunk), bB(chunk);
-  bool eofC = false, eofU = false;   // C=客户端 EOF, U=上游 EOF
-
-  while (!(eofC && eofU)) {
-    fd_set rf; FD_ZERO(&rf);
-    if (!eofC) FD_SET(c, &rf);
-    if (!eofU) FD_SET(u, &rf);
-    int nfds = SELECT_NFDS(c, u);
-    int sel = select(nfds, &rf, nullptr, nullptr, nullptr);
-    if (sel < 0) {
-      if (SOCK_ERRNO() == E_INTR) continue;
-      break;
-    }
-    if (sel == 0) continue;
-
-    bool rc = (!eofC) && FD_ISSET(c, &rf);
-    bool ru = (!eofU) && FD_ISSET(u, &rf);
-
-    if (rc) {
-      int n = (int)recv(c, bA.data(), (int)bA.size(), 0);
-      if (n > 0) {
-        if (!send_all(u, bA.data(), (size_t)n)) break;   // 上游已断
-      } else if (n == 0) {
-        eofC = true;
-        shutdown(u, SHUT_SEND);          // 向目标传播 EOF(半关闭)
-      } else {
-        int e = SOCK_ERRNO();
-        if (e == E_CONNRESET) { eofC = true; shutdown(u, SHUT_SEND); }
-        else break;
-      }
-    }
-    if (ru) {
-      int n = (int)recv(u, bB.data(), (int)bB.size(), 0);
-      if (n > 0) {
-        if (!send_all(c, bB.data(), (size_t)n)) break;   // 客户端已断
-      } else if (n == 0) {
-        eofU = true;
-        shutdown(c, SHUT_SEND);          // 向客户端传播 EOF
-      } else {
-        int e = SOCK_ERRNO();
-        if (e == E_CONNRESET) { eofU = true; shutdown(c, SHUT_SEND); }
-        else break;
-      }
-    }
-  }
-  closesock(u);
-  closesock(c);
-  g_active_tcp.fetch_sub(1);
-  logv(o, "tcp: connection closed");
+  g_active_tcp.fetch_sub(1);   // 放在 try 之后: 保证释放恰好一次
 }
 
 static int run_tcp(const Options& o) {
@@ -366,13 +430,43 @@ static int run_tcp(const Options& o) {
           o.listen_host.empty() ? "0.0.0.0" : o.listen_host.c_str(), o.listen_port,
           o.target_host.c_str(), o.target_port);
 
+  // 并发连接上限: 超限直接拒绝新连接, 避免线程数失控把整机资源拖垮
+  const int maxConns = 1024;
   while (!g_stop.load()) {
     pollfd p{ listener, POLLIN, 0 };
     if (xpoll(&p, 1, 1000) > 0 && (p.revents & (POLLIN | POLLERR | POLLHUP))) {
       for (;;) {
         sock_t c = accept(listener, nullptr, nullptr);
-        if (c == kInvalid) break;
-        std::thread(tcp_worker, c, o, targets).detach();
+        if (c == kInvalid) {
+          int e = SOCK_ERRNO();
+          // 非阻塞监听套接字的连接队列已抽干: 正常路径, 回到 poll 等待
+          if (e == E_WOULDBLOCK || e == E_INTR) break;
+          // 三次握手期间对端消失: 该连接作废, 继续处理队列里的下一个
+          if (e == E_CONNABORT) continue;
+          // 其余是资源类/套接字级错误(如 fd 耗尽)。此时待处理连接仍留在队列里,
+          // poll 会立即返回, 若不退避就会形成 100% CPU 忙等 + 日志风暴。
+          if (e == E_MFILE || e == E_NOBUFS) {
+            logline("warning: tcp: accept failed: resource exhausted (%s), backing off 100ms",
+                    sockerr_str().c_str());
+          } else {
+            logline("warning: tcp: accept failed (%s), backing off 100ms",
+                    sockerr_str().c_str());
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          break;
+        }
+        if (g_active_tcp.load() >= maxConns) {
+          logline("warning: tcp: too many active connections (>= %d), rejecting", maxConns);
+          closesock(c);
+          continue;
+        }
+        try {
+          std::thread(tcp_worker, c, o, targets).detach();
+        } catch (const std::exception& ex) {
+          // 线程创建失败(fd/内存不足): 必须关掉已 accept 的套接字, 否则句柄泄漏
+          logline("warning: tcp: cannot spawn worker thread (%s), connection dropped", ex.what());
+          closesock(c);
+        }
       }
     }
   }
