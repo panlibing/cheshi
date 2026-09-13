@@ -1,0 +1,34 @@
+# ============================================================================
+# 换行符策略: 保证 shell 脚本在 Linux/CI 检出后一定是 LF
+#   (Windows 本地因 core.autocrlf=true 会把工作区文件转成 CRLF, 若把 CRLF 的
+#    .sh 提交进仓库, Linux 上会报 "bad interpreter: /bin/bash^M"; 反之把 CRLF
+#    的脚本留在工作区, Git Bash 里也会出现 $'\r' 报错)
+# ============================================================================
+
+* text=auto
+
+# shell / 构建脚本: 强制 LF(仓库内与检出后都是 LF)
+.gitattributes text eol=lf
+*.sh          text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+Makefile      text eol=lf
+build.sh      text eol=lf
+
+# Windows 脚本: 强制 CRLF
+*.bat         text eol=crlf
+*.cmd         text eol=crlf
+*.ps1         text eol=crlf
+
+# C/C++ 源码与文档: 按 text=auto 处理即可, 这里显式声明便于理解
+*.cpp         text
+*.h           text
+*.md          text
+
+# 二进制产物: 禁止任何换行符转换
+*.exe         binary
+*.obj         binary
+*.pdb         binary
+*.ilk         binary
+*.o           binary
+*.a           binary

@@ -1,0 +1,59 @@
+name: port_relay CI
+
+# 仅当 port_relay 相关文件或本工作流本身变化时触发
+on:
+  push:
+    paths:
+      - 'port_relay/**'
+      - '.github/workflows/port_relay-ci.yml'
+  pull_request:
+    paths:
+      - 'port_relay/**'
+      - '.github/workflows/port_relay-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-build-test:
+    name: Linux 构建 + 端到端自测 (${{ matrix.cxx }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    env:
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 工具链版本
+        run: |
+          $CXX --version | head -n 1
+          bash --version | head -n 1
+
+      - name: 构建 portrelay (bash build.sh)
+        working-directory: port_relay
+        run: bash build.sh
+
+      - name: 构建自测用 echo / probe
+        working-directory: port_relay/tests
+        run: |
+          $CXX -std=c++17 -O2 -Wall -Wextra -pthread -o echo  echo.cpp
+          $CXX -std=c++17 -O2 -Wall -Wextra -pthread -o probe probe.cpp
+
+      - name: 语法检查 (bash -n)
+        working-directory: port_relay
+        run: bash -n tests/run_tests.sh && echo 'run_tests.sh 语法 OK'
+
+      - name: Linux 端到端自测 (bash tests/run_tests.sh)
+        working-directory: port_relay
+        run: bash tests/run_tests.sh
+
+      - name: 失败时打印产物信息
+        if: failure()
+        working-directory: port_relay
+        run: ls -l portrelay tests/echo tests/probe 2>/dev/null || true

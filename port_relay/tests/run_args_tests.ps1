@@ -102,9 +102,9 @@ try {
     '# args_test.conf - test only',
     '; semicolon comment',
     'tcp 47107 127.0.0.1 47102 127.0.0.1 -b 256    # positional form',
-    'mode = tcp',
-    'listen = 127.0.0.1:47109',
-    'target = 127.0.0.1:47102',
+    '# each config line must be a COMPLETE rule (lines are flushed as they are read),',
+    'rule = tcp:127.0.0.1:47109->127.0.0.1:47102   # key=value form = one complete rule',
+    '# (a bare "target = host:port" line is NOT valid: every line must be one complete rule)',
     'verbose = off'
   ) | Set-Content -Path $confFile -Encoding ASCII
   Start-Bg @('-f', $confFile) | Out-Null
@@ -118,7 +118,7 @@ try {
   Check '--key=value form' (Test-Tcp 47111)
 
   Write-Host '== 6) no args: auto-load portrelay.conf next to exe ==' -ForegroundColor Cyan
-  @('mode=tcp', 'listen=47113', 'target=127.0.0.1:47102') | Set-Content -Path $autoConf -Encoding ASCII
+  @('rule = tcp:127.0.0.1:47113->127.0.0.1:47102') | Set-Content -Path $autoConf -Encoding ASCII
   Start-Bg @() | Out-Null
   Start-Sleep -Milliseconds 700
   Check 'default config auto-load' (Test-Tcp 47113)
@@ -129,6 +129,8 @@ try {
   Check 'UDP named args relay' (Test-Udp 47115)
 
   Write-Host '== 8) help / version / error paths ==' -ForegroundColor Cyan
+  # error-path cases write to stderr on purpose; native stderr must not abort the run
+  $ErrorActionPreference = 'Continue'
   $out = (& $relay -h 2>&1 | Out-String)
   Check 'help exit code 0' ($LASTEXITCODE -eq 0)
   Check 'help shows options' ($out -match '--rule')
@@ -139,7 +141,7 @@ try {
   $out = (& $relay -M tcp -l 9000 -t 10.0.0.1 2>&1 | Out-String)
   Check 'target without port rejected' (($LASTEXITCODE -ne 0) -and ($out -match 'host:port'))
   $out = (& $relay --mode tcp -l 9000 2>&1 | Out-String)
-  Check 'incomplete rule rejected' (($LASTEXITCODE -ne 0) -and ($out -match '\(tcp\|udp\)'))
+  Check 'incomplete rule rejected' (($LASTEXITCODE -ne 0) -and ($out -match '\[relay\] error'))
   $out = (& $relay -M ftp -l 9000 -t 1.2.3.4:80 2>&1 | Out-String)
   Check 'bad mode rejected' (($LASTEXITCODE -ne 0) -and ($out -match 'ftp'))
   $out = (& $relay tcp 9000 1.2.3.4:80 2>&1 | Out-String)
@@ -147,8 +149,8 @@ try {
   $out = (& $relay --rule 'bad-spec' 2>&1 | Out-String)
   Check 'bad rule spec rejected' (($LASTEXITCODE -ne 0) -and ($out -match 'bad-spec'))
   $out = (& $relay -f no_such_file.conf 2>&1 | Out-String)
-  Check 'missing config rejected' (($LASTEXITCODE -ne 0) -and ($out -match 'no_such_file\.conf'))
-  $out = (& $relay 2>&1 | Out-String)
+  Check 'missing config rejected' (($LASTEXITCODE -ne 0) -and ($out -match 'no_such_file\.conf')); $badConf = Join-Path $PSScriptRoot 'args_bad.conf'; @('tcp 47118 127.0.0.1 47102 127.0.0.1','target = 1.2.3.4:80') | Set-Content -Path $badConf -Encoding ASCII; $out = (& $relay -f $badConf 2>&1 | Out-String); Check 'incomplete config line rejected' (($LASTEXITCODE -ne 0) -and ($out -match 'args_bad\.conf')); Remove-Item $badConf -Force -ErrorAction SilentlyContinue
+  if (Test-Path $autoConf) { Remove-Item $autoConf -Force -ErrorAction SilentlyContinue }; $out = (& $relay 2>&1 | Out-String)
   Check 'no args without default config rejected' (($LASTEXITCODE -ne 0) -and ($out -match 'portrelay\.conf'))
 
   Write-Host ''

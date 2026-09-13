@@ -701,10 +701,10 @@ static bool feed_tokens(const std::vector<std::string>& in, ParseState& st, std:
 static bool flush_rule(ParseState& st, std::string& err) {
   if (!(st.has_mode || st.has_lport || st.has_thost || st.has_tport || st.has_lhost)) return true;
   std::string missing;
-  if (!st.has_mode)  missing += " 模式(tcp|udp)";
-  if (!st.has_lport) missing += " 监听端口";
-  if (!st.has_thost) missing += " 目标主机";
-  if (!st.has_tport) missing += " 目标端口";
+  if (!st.has_mode)  missing += " --mode (tcp|udp)";
+  if (!st.has_lport) missing += " --listen-port";
+  if (!st.has_thost) missing += " --target-host";
+  if (!st.has_tport) missing += " --target-port";
   if (!missing.empty()) { err = "转发规则不完整, 缺少:" + missing; return false; }
   Options o;
   o.mode        = st.mode;
@@ -931,7 +931,7 @@ static bool truthy(const std::string& v) {
 static bool config_line_to_tokens(const std::string& line, std::vector<std::string>& toks, std::string& err) {
   toks.clear();
   size_t eq = line.find('=');
-  if (eq != std::string::npos && line.find("->") == std::string::npos) {
+  if (eq != std::string::npos) {   // rule= 的取值含 "->", 逐键判定见下
     std::string key = lower_str(trim_str(line.substr(0, eq)));
     std::string val = trim_str(line.substr(eq + 1));
     for (char& c : key) if (c == '_') c = '-';
@@ -939,18 +939,23 @@ static bool config_line_to_tokens(const std::string& line, std::vector<std::stri
     for (const ConfigKey& k : kConfigKeys) {
       if (key == k.key) { opt = k.opt; break; }
     }
-    if (opt) {
-      if (std::strcmp(opt, "--verbose") == 0) {
-        if (truthy(val)) toks.push_back("--verbose");   // verbose=off / =false 直接忽略
+    // rule = <规则串> 的取值里必然含 "->", 只有该键允许取值带箭头,
+    // 其余含 "->" 的行仍按空白切分(位置写法 / 规则行)。
+    const bool rule_key = (opt != nullptr && std::strcmp(opt, "--rule") == 0);
+    if (line.find("->") == std::string::npos || rule_key) {
+      if (opt) {
+        if (std::strcmp(opt, "--verbose") == 0) {
+          if (truthy(val)) toks.push_back("--verbose");   // verbose=off / =false 直接忽略
+          return true;
+        }
+        if (val.empty()) { err = "配置项 " + key + " 缺少取值"; return false; }
+        toks.push_back(opt);
+        toks.push_back(val);
         return true;
       }
-      if (val.empty()) { err = "配置项 " + key + " 缺少取值"; return false; }
-      toks.push_back(opt);
-      toks.push_back(val);
-      return true;
+      err = "未知配置项: " + key;
+      return false;
     }
-    err = "未知配置项: " + key;
-    return false;
   }
   toks = split_ws(line);
   return true;
