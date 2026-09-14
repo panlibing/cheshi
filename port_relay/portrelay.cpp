@@ -13,7 +13,15 @@
 //   * 可选增大收发内核缓冲区(-b), 减少突发流量下的丢包;
 //   * 回包经监听套接字发回, 客户端看到的对端地址始终是"监听地址:端口"。
 //
-//  用法(三种写法等价, 可混用; 支持一次启动多条规则):
+//   * 可靠性: TCP 并发连接上限可配(--max-conns); TCP keepalive 与空闲超时
+//            (--keepalive/--idle-timeout) 自动回收僵死连接; UDP 单轮批量上限
+//            防止单个会话饿死其它会话; 收到退出信号后先停止接收新连接, 再在
+//            --drain-timeout 内等待在途连接自然结束(优雅停机)。
+//   * 可观测: 运行统计(--stats-interval) + 分级日志(--log-level/--log-file),
+//            线上问题可从日志与计数器直接定位。
+//   * 可运维: 收到 SIGHUP 重读配置文件, 只重启发生变化的规则(POSIX)。
+//
+//  用法(四种写法等价, 可混用; 支持一次启动多条规则):
 //     1) 位置写法(兼容旧版):
 //          portrelay <tcp|udp> <listen_port> <target_host> <target_port>
 //                    [listen_host] [-b KB] [-u sec] [-m max] [-v] [-h]
@@ -40,6 +48,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
+#include <cstdint>
+#include <ctime>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -47,9 +57,11 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <memory>
 #include <algorithm>
 #include <climits>
 #include <fstream>
+#include <sstream>
 #include <cctype>
 
 #ifdef _WIN32
@@ -57,7 +69,10 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
-  #pragma comment(lib, "ws2_32.lib")
+  #include <mstcpip.h>   // SIO_KEEPALIVE_VALS / tcp_keepalive
+  #ifdef _MSC_VER
+    #pragma comment(lib, "ws2_32.lib")   // MSVC 自动链接; MinGW(g++) 用 -lws2_32
+  #endif
   using sock_t = SOCKET;
   const sock_t kInvalid = INVALID_SOCKET;
   #define SOCK_ERRNO()  WSAGetLastError()
@@ -105,7 +120,15 @@
 // 全局配置 / 工具函数
 // ----------------------------------------------------------------------------
 static std::atomic<bool> g_stop{false};
-static std::atomic<int>  g_active_tcp{0};
+static std::atomic<bool> g_reload{false};      // SIGHUP: 请求重读配置
+static std::atomic<int>  g_signal_count{0};    // 收到退出信号次数(>=2 = 立即退出)
+static std::atomic<int>  g_active_tcp{0};      // 全局在途 TCP 连接数(统计用)
+static std::atomic<int>  g_runners_alive{0};   // 仍在运行的规则线程数(全部退出 => 进程退出)
+static std::atomic<int>  g_exit_code{0};       // 任一规则异常退出 => 进程退出码非 0
+
+// 运行期可调项(与具体规则无关, 由命令行/配置文件的全局项设置)
+static std::atomic<int>  g_stats_interval{0};  // 秒; 0 = 关闭周期统计
+static std::atomic<int>  g_drain_timeout{5};   // 秒; 优雅停机等待在途连接的上限
 
 struct Options {
   std::string mode;        // tcp | udp
@@ -116,6 +139,10 @@ struct Options {
   int  sockbuf_kb   = 256; // 内核收发缓冲 (KB)
   int  udp_timeout  = 60;  // UDP 空闲会话超时(秒)
   int  udp_max      = 1024;// UDP 最大并发会话
+  int  udp_batch    = 64;  // UDP 单轮 poll 每个会话最多处理的数据报数(0=不限制)
+  int  max_conns    = 1024;// TCP 最大并发连接数(0=不限制)
+  int  keepalive    = 0;   // TCP keepalive 空闲探测启动秒数(0=关闭)
+  int  idle_timeout = 0;   // TCP 双向空闲无数据超时秒数(0=关闭)
   bool verbose      = false;
 };
 
@@ -125,28 +152,130 @@ struct AddrInfo {
   int              family = AF_UNSPEC;
 };
 
-static std::mutex g_log_mu;
-static void logline(const char* fmt, ...) {
-  std::lock_guard<std::mutex> lk(g_log_mu);
-  va_list ap; va_start(ap, fmt);
-  std::fputs("[relay] ", stdout);
-  std::vprintf(fmt, ap);
-  va_end(ap);
-  std::fputc('\n', stdout);
-  std::fflush(stdout);
-}
-static void logv(const Options& o, const char* fmt, ...) {
-  if (!o.verbose) return;
-  std::lock_guard<std::mutex> lk(g_log_mu);
-  std::fputs("[relay] ", stdout);
-  va_list ap; va_start(ap, fmt);
-  std::vprintf(fmt, ap);
-  va_end(ap);
-  std::fputc('\n', stdout);
-  std::fflush(stdout);
+// 规则规范化字符串: 用于热重载时比较"这条规则是否发生了变化"
+static std::string rule_spec(const Options& o) {
+  std::ostringstream os;
+  os << o.mode << '|'
+     << (o.listen_host.empty() ? std::string("*") : o.listen_host) << '|'
+     << o.listen_port << '|' << o.target_host << '|' << o.target_port << '|'
+     << o.sockbuf_kb << '|' << o.udp_timeout << '|' << o.udp_max << '|' << o.udp_batch << '|'
+     << o.max_conns << '|' << o.keepalive << '|' << o.idle_timeout << '|'
+     << (o.verbose ? 1 : 0);
+  return os.str();
 }
 
-static bool sockerr_is(int e, int kind) { return e == kind; }
+// ----------------------------------------------------------------------------
+// 日志: 分级(ERROR/WARN/INFO/DEBUG) + 时间戳 + 可选写文件
+// ----------------------------------------------------------------------------
+enum LogLevel { LOG_ERROR = 0, LOG_WARN = 1, LOG_INFO = 2, LOG_DEBUG = 3 };
+
+static std::atomic<int> g_log_level{LOG_INFO};
+static std::mutex       g_log_mu;
+static FILE*            g_log_fp = nullptr;    // nullptr = 写 stdout
+static std::string      g_log_path;            // 非空 = 已打开的日志文件路径
+
+static bool parse_log_level(const std::string& s, int& out) {
+  std::string t = s;
+  for (char& c : t) c = (char)std::tolower((unsigned char)c);
+  size_t b = 0, e = t.size();
+  while (b < e && (unsigned char)t[b] <= ' ') ++b;
+  while (e > b && (unsigned char)t[e - 1] <= ' ') --e;
+  t = t.substr(b, e - b);
+  if (t == "error" || t == "err"   || t == "0") { out = LOG_ERROR; return true; }
+  if (t == "warn"  || t == "warning" || t == "1") { out = LOG_WARN;  return true; }
+  if (t == "info"  || t == "2")                 { out = LOG_INFO;  return true; }
+  if (t == "debug" || t == "dbg" || t == "verbose" || t == "3") { out = LOG_DEBUG; return true; }
+  return false;
+}
+
+static void log_ts(char* buf, size_t n) {
+  std::time_t t = std::time(nullptr);
+  std::tm tmv{};
+#ifdef _WIN32
+  localtime_s(&tmv, &t);
+#else
+  localtime_r(&t, &tmv);
+#endif
+  std::strftime(buf, n, "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
+static void log_emit(int level, const char* fmt, va_list ap) {
+  if (level > g_log_level.load(std::memory_order_relaxed)) return;
+  static const char* const names[] = {"ERROR", "WARN", "INFO", "DEBUG"};
+  int idx = level < 0 ? 0 : (level > 3 ? 3 : level);
+  char ts[32];
+  log_ts(ts, sizeof(ts));
+  std::lock_guard<std::mutex> lk(g_log_mu);
+  FILE* fp = g_log_fp ? g_log_fp : stdout;
+  std::fprintf(fp, "%s [%s] [relay] ", ts, names[idx]);
+  std::vfprintf(fp, fmt, ap);
+  std::fputc('\n', fp);
+  std::fflush(fp);
+}
+
+static void logmsg(int level, const char* fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  log_emit(level, fmt, ap);
+  va_end(ap);
+}
+// 连接/会话级细节日志: 统一按 DEBUG 级别输出, 是否可见由全局日志级别决定
+// (即 -v/--verbose 或 --log-level debug 打开)。保留参数以兼容既有调用点。
+static void logv(const Options& o, const char* fmt, ...) {
+  (void)o;
+  va_list ap; va_start(ap, fmt);
+  log_emit(LOG_DEBUG, fmt, ap);
+  va_end(ap);
+}
+
+#define logline(...) logmsg(LOG_INFO,  __VA_ARGS__)
+#define loge(...)    logmsg(LOG_ERROR, __VA_ARGS__)
+#define logw(...)    logmsg(LOG_WARN,  __VA_ARGS__)
+#define logd(...)    logmsg(LOG_DEBUG, __VA_ARGS__)
+
+// ----------------------------------------------------------------------------
+// 运行统计(原子计数, 供 --stats-interval 周期输出 / 停机时汇总)
+// ----------------------------------------------------------------------------
+struct Stats {
+  std::atomic<uint64_t> tcp_conns_opened{0};
+  std::atomic<uint64_t> tcp_conns_rejected{0};
+  std::atomic<uint64_t> tcp_bytes_c2u{0};   // 客户端 -> 目标
+  std::atomic<uint64_t> tcp_bytes_u2c{0};   // 目标 -> 客户端
+  std::atomic<uint64_t> udp_dgrams_in{0};   // 客户端 -> 目标
+  std::atomic<uint64_t> udp_dgrams_out{0};  // 目标 -> 客户端
+  std::atomic<uint64_t> udp_sessions_created{0};
+  std::atomic<uint64_t> udp_dropped{0};     // 无法投递而丢弃的数据报
+};
+static Stats g_stats;
+static std::atomic<int> g_active_udp{0};     // 全局活跃 UDP 会话数(统计用)
+
+static void log_stats() {
+  logline("stats: tcp[active=%d opened=%llu rejected=%llu up=%lluB dn=%lluB] "
+          "udp[active=%d in=%llu out=%llu sessions=%llu dropped=%llu]",
+          g_active_tcp.load(), (unsigned long long)g_stats.tcp_conns_opened.load(),
+          (unsigned long long)g_stats.tcp_conns_rejected.load(),
+          (unsigned long long)g_stats.tcp_bytes_c2u.load(),
+          (unsigned long long)g_stats.tcp_bytes_u2c.load(),
+          g_active_udp.load(), (unsigned long long)g_stats.udp_dgrams_in.load(),
+          (unsigned long long)g_stats.udp_dgrams_out.load(),
+          (unsigned long long)g_stats.udp_sessions_created.load(),
+          (unsigned long long)g_stats.udp_dropped.load());
+}
+
+// 打开(追加)日志文件; 失败则保持写 stdout
+static bool open_log_file(const std::string& path) {
+  if (path.empty()) return true;
+  if (path == g_log_path && g_log_fp) return true;
+  FILE* fp = std::fopen(path.c_str(), "a");
+  if (!fp) {
+    logw("warning: 无法打开日志文件 %s, 继续写 stdout", path.c_str());
+    return false;
+  }
+  std::lock_guard<std::mutex> lk(g_log_mu);
+  if (g_log_fp) std::fclose(g_log_fp);
+  g_log_fp   = fp;
+  g_log_path = path;
+  return true;
+}
 
 static std::string sockerr_str() {
 #ifdef _WIN32
@@ -220,6 +349,33 @@ static void set_sockbufs(sock_t s, int bytes) {
 static void set_nodelay(sock_t s) {
   int one = 1;
   setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+}
+
+// 开启 TCP keepalive: 连接空闲 idle_sec 秒后开始发送探测包。
+// 探测由内核完成, 用于在没有应用层数据时回收"对端已消失但未发 FIN"的僵死连接。
+static void set_keepalive(sock_t s, int idle_sec) {
+  if (idle_sec <= 0) return;
+  int one = 1;
+  setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&one, sizeof(one));
+#ifdef _WIN32
+  tcp_keepalive ka;
+  ka.onoff             = 1;
+  ka.keepalivetime     = (ULONG)idle_sec * 1000;  // 首次探测前空闲(ms)
+  ka.keepaliveinterval = 1000;                     // 探测间隔(ms)
+  DWORD ret = 0;
+  WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, (DWORD)sizeof(ka), nullptr, 0, &ret, nullptr, nullptr);
+#else
+  int idle = idle_sec, intvl = 10, cnt = 3;
+  #ifdef TCP_KEEPIDLE
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&idle, sizeof(idle));
+  #endif
+  #ifdef TCP_KEEPINTVL
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&intvl, sizeof(intvl));
+  #endif
+  #ifdef TCP_KEEPCNT
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, (const char*)&cnt, sizeof(cnt));
+  #endif
+#endif
 }
 
 // 创建并绑定监听套接字(TCP/UDP 通用)
@@ -315,12 +471,23 @@ static bool send_all(sock_t s, const char* data, size_t n) {
   return true;
 }
 
-static void tcp_worker(sock_t c, const Options& o, const std::vector<AddrInfo>& targets) {
-  g_active_tcp.fetch_add(1);
+// 每条规则的运行上下文: 支持"重载时单独停止该规则"与"停机 drain"。
+struct RuleCtx {
+  std::atomic<bool> stop{false};   // 请求停止本条规则(进程退出或热重载替换)
+  std::atomic<bool> force{false};  // 停机宽限期已过: 立即断开在途连接
+  std::atomic<int>  active{0};     // 本条规则在途 TCP 连接数
+};
 
-  // 客户端套接字显式复位为阻塞模式并抑制 SIGPIPE
+static void tcp_worker(sock_t c, const Options& o, const std::vector<AddrInfo>& targets,
+                       RuleCtx* ctx) {
+  ctx->active.fetch_add(1);
+  g_active_tcp.fetch_add(1);
+  g_stats.tcp_conns_opened.fetch_add(1);
+
+  // 客户端套接字显式复位为阻塞模式并抑制 SIGPIPE, 并按需开启 keepalive
   set_blocking(c);
   set_nosigpipe(c);
+  set_keepalive(c, o.keepalive);
 
   // u 在 try 之外声明: catch 里需要根据它判断上游套接字是否已建立, 避免重复关闭
   sock_t u = kInvalid;
@@ -338,11 +505,13 @@ static void tcp_worker(sock_t c, const Options& o, const std::vector<AddrInfo>& 
            o.target_host.c_str(), o.target_port, sockerr_str().c_str());
       closesock(c);
       c = kInvalid;
+      ctx->active.fetch_sub(1);
       g_active_tcp.fetch_sub(1);
       return;
     }
     set_blocking(u);
     set_nosigpipe(u);
+    set_keepalive(u, o.keepalive);
 
     set_sockbufs(c, o.sockbuf_kb * 1024);
     set_sockbufs(u, o.sockbuf_kb * 1024);
@@ -353,17 +522,32 @@ static void tcp_worker(sock_t c, const Options& o, const std::vector<AddrInfo>& 
     const size_t chunk = std::min<size_t>((size_t)o.sockbuf_kb * 1024, 65536);
     std::vector<char> bA(chunk), bB(chunk);
     bool eofC = false, eofU = false;   // C=客户端 EOF, U=上游 EOF
+    auto last_activity = std::chrono::steady_clock::now();
 
     while (!(eofC && eofU)) {
+      if (ctx->force.load()) break;    // 停机宽限期已过: 强制断开
       // 用 poll 取代 select: 单连接下无性能差异, 但彻底规避 fd_set 的
       // FD_SETSIZE 限制(句柄号 >= FD_SETSIZE 时 FD_SET/FD_ISSET 会越界写内存)。
+      // 1s 超时让本线程能周期性检查"停止/空闲"而不会永久阻塞。
       pollfd pf[2] = { { c, POLLIN, 0 }, { u, POLLIN, 0 } };
-      int sel = xpoll(pf, 2, -1);
+      int sel = xpoll(pf, 2, 1000);
       if (sel < 0) {
         if (SOCK_ERRNO() == E_INTR) continue;
         break;
       }
-      if (sel == 0) continue;
+      if (sel == 0) {
+        // 应用层空闲超时: 双向在 idle_timeout 秒内都没有任何数据 -> 主动断开
+        if (o.idle_timeout > 0) {
+          auto idle = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::steady_clock::now() - last_activity).count();
+          if (idle >= o.idle_timeout) {
+            logv(o, "tcp: connection idle for %llds >= %ds, closing",
+                 (long long)idle, o.idle_timeout);
+            break;
+          }
+        }
+        continue;
+      }
 
       bool rc = (!eofC) && (pf[0].revents & (POLLIN | POLLERR | POLLHUP));
       bool ru = (!eofU) && (pf[1].revents & (POLLIN | POLLERR | POLLHUP));
@@ -371,6 +555,8 @@ static void tcp_worker(sock_t c, const Options& o, const std::vector<AddrInfo>& 
       if (rc) {
         int n = (int)recv(c, bA.data(), (int)bA.size(), 0);
         if (n > 0) {
+          last_activity = std::chrono::steady_clock::now();
+          g_stats.tcp_bytes_c2u.fetch_add((uint64_t)n);
           if (!send_all(u, bA.data(), (size_t)n)) break;   // 上游已断
         } else if (n == 0) {
           eofC = true;
@@ -385,6 +571,8 @@ static void tcp_worker(sock_t c, const Options& o, const std::vector<AddrInfo>& 
       if (ru) {
         int n = (int)recv(u, bB.data(), (int)bB.size(), 0);
         if (n > 0) {
+          last_activity = std::chrono::steady_clock::now();
+          g_stats.tcp_bytes_u2c.fetch_add((uint64_t)n);
           if (!send_all(c, bB.data(), (size_t)n)) break;   // 客户端已断
         } else if (n == 0) {
           eofU = true;
@@ -405,34 +593,37 @@ static void tcp_worker(sock_t c, const Options& o, const std::vector<AddrInfo>& 
   } catch (const std::exception& ex) {
     // 线程函数里逃逸的异常会直接 std::terminate 掉整个进程, 必须就地兜住;
     // 同时保证套接字与连接计数不泄漏。
-    logline("warning: tcp: connection aborted: %s", ex.what());
+    logw("warning: tcp: connection aborted: %s", ex.what());
     if (u != kInvalid) closesock(u);
     if (c != kInvalid) closesock(c);
   } catch (...) {
-    logline("warning: tcp: connection aborted (unknown exception)");
+    logw("warning: tcp: connection aborted (unknown exception)");
     if (u != kInvalid) closesock(u);
     if (c != kInvalid) closesock(c);
   }
-  g_active_tcp.fetch_sub(1);   // 放在 try 之后: 保证释放恰好一次
+  // 放在 try 之后: 保证释放恰好一次(含提前 return 的分支已单独减过)
+  ctx->active.fetch_sub(1);
+  g_active_tcp.fetch_sub(1);
 }
 
-static int run_tcp(const Options& o) {
+static int run_tcp(const Options& o, RuleCtx* ctx) {
   std::string err;
   std::vector<AddrInfo> targets;
   if (!resolve(o.target_host, o.target_port, SOCK_STREAM, false, targets, err)) {
-    logline("error: cannot resolve target %s:%d : %s",
-            o.target_host.c_str(), o.target_port, err.c_str());
+    loge("error: cannot resolve target %s:%d : %s",
+         o.target_host.c_str(), o.target_port, err.c_str());
     return 1;
   }
   sock_t listener = create_listener(o, SOCK_STREAM, err);
-  if (listener == kInvalid) { logline("error: %s", err.c_str()); return 1; }
-  logline("TCP relay  %s:%d  ->  %s:%d   (Ctrl+C 停止)",
+  if (listener == kInvalid) { loge("error: %s", err.c_str()); return 1; }
+  logline("TCP relay  %s:%d  ->  %s:%d   (max-conns %d%s Ctrl+C 停止)",
           o.listen_host.empty() ? "0.0.0.0" : o.listen_host.c_str(), o.listen_port,
-          o.target_host.c_str(), o.target_port);
+          o.target_host.c_str(), o.target_port, o.max_conns,
+          o.idle_timeout > 0 ? ", idle-timeout on" : "");
 
   // 并发连接上限: 超限直接拒绝新连接, 避免线程数失控把整机资源拖垮
-  const int maxConns = 1024;
-  while (!g_stop.load()) {
+  const int maxConns = o.max_conns;
+  while (!g_stop.load() && !ctx->stop.load()) {
     pollfd p{ listener, POLLIN, 0 };
     if (xpoll(&p, 1, 1000) > 0 && (p.revents & (POLLIN | POLLERR | POLLHUP))) {
       for (;;) {
@@ -446,32 +637,55 @@ static int run_tcp(const Options& o) {
           // 其余是资源类/套接字级错误(如 fd 耗尽)。此时待处理连接仍留在队列里,
           // poll 会立即返回, 若不退避就会形成 100% CPU 忙等 + 日志风暴。
           if (e == E_MFILE || e == E_NOBUFS) {
-            logline("warning: tcp: accept failed: resource exhausted (%s), backing off 100ms",
-                    sockerr_str().c_str());
+            logw("warning: tcp: accept failed: resource exhausted (%s), backing off 100ms",
+                 sockerr_str().c_str());
           } else {
-            logline("warning: tcp: accept failed (%s), backing off 100ms",
-                    sockerr_str().c_str());
+            logw("warning: tcp: accept failed (%s), backing off 100ms",
+                 sockerr_str().c_str());
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(100));
           break;
         }
-        if (g_active_tcp.load() >= maxConns) {
-          logline("warning: tcp: too many active connections (>= %d), rejecting", maxConns);
+        if (maxConns > 0 && ctx->active.load() >= maxConns) {
+          g_stats.tcp_conns_rejected.fetch_add(1);
+          logw("warning: tcp: too many active connections (>= %d), rejecting", maxConns);
           closesock(c);
           continue;
         }
         try {
-          std::thread(tcp_worker, c, o, targets).detach();
+          std::thread(tcp_worker, c, o, targets, ctx).detach();
         } catch (const std::exception& ex) {
           // 线程创建失败(fd/内存不足): 必须关掉已 accept 的套接字, 否则句柄泄漏
-          logline("warning: tcp: cannot spawn worker thread (%s), connection dropped", ex.what());
+          logw("warning: tcp: cannot spawn worker thread (%s), connection dropped", ex.what());
           closesock(c);
         }
       }
     }
   }
   closesock(listener);
-  logline("TCP relay stopped (active connections: %d)", g_active_tcp.load());
+  logline("TCP relay stopped accepting (rule %s:%d)",
+          o.listen_host.empty() ? "0.0.0.0" : o.listen_host.c_str(), o.listen_port);
+
+  // ---- 优雅停机(drain): 等待在途连接自然结束, 超时后强制断开 -------------
+  if (ctx->active.load() > 0) {
+    const int drain = g_drain_timeout.load();
+    logline("TCP relay draining %d in-flight connection(s), up to %ds ...",
+            ctx->active.load(), drain);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(drain);
+    while (ctx->active.load() > 0 && std::chrono::steady_clock::now() < deadline &&
+           g_signal_count.load() < 2) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (ctx->active.load() > 0) {
+      logw("warning: drain timeout/forced, closing %d connection(s)", ctx->active.load());
+      ctx->force.store(true);
+      auto hard = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (ctx->active.load() > 0 && std::chrono::steady_clock::now() < hard) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+    }
+  }
+  logline("TCP relay stopped (active connections: %d)", ctx->active.load());
   return 0;
 }
 
@@ -493,24 +707,25 @@ static std::string client_key(const sockaddr_storage& sa, socklen_t len) {
   return "?";
 }
 
-static int run_udp(const Options& o) {
+static int run_udp(const Options& o, RuleCtx* ctx) {
   std::string err;
   std::vector<AddrInfo> targets;
   if (!resolve(o.target_host, o.target_port, SOCK_DGRAM, false, targets, err)) {
-    logline("error: cannot resolve target %s:%d : %s",
-            o.target_host.c_str(), o.target_port, err.c_str());
+    loge("error: cannot resolve target %s:%d : %s",
+         o.target_host.c_str(), o.target_port, err.c_str());
     return 1;
   }
   sock_t listener = create_listener(o, SOCK_DGRAM, err);
-  if (listener == kInvalid) { logline("error: %s", err.c_str()); return 1; }
-  logline("UDP relay  %s:%d  ->  %s:%d   (会话超时 %ds, 上限 %d, Ctrl+C 停止)",
+  if (listener == kInvalid) { loge("error: %s", err.c_str()); return 1; }
+  logline("UDP relay  %s:%d  ->  %s:%d   (会话超时 %ds, 上限 %d, 批量 %d, Ctrl+C 停止)",
           o.listen_host.empty() ? "0.0.0.0" : o.listen_host.c_str(), o.listen_port,
-          o.target_host.c_str(), o.target_port, o.udp_timeout, o.udp_max);
+          o.target_host.c_str(), o.target_port, o.udp_timeout, o.udp_max, o.udp_batch);
 
   const AddrInfo& tgt = targets[0];
   std::unordered_map<std::string, UdpSession> byKey;   // client key -> session
   std::unordered_map<sock_t, std::string>     bySock;  // session socket -> key
   std::vector<char> buf(65535);
+  const int batch = o.udp_batch > 0 ? o.udp_batch : INT_MAX;   // 单轮每句柄处理上限
 
   const auto erase_session = [&](const std::string& key, const char* why) {
     auto it = byKey.find(key);
@@ -518,6 +733,7 @@ static int run_udp(const Options& o) {
     closesock(it->second.s);
     bySock.erase(it->second.s);
     byKey.erase(it);
+    g_active_udp.fetch_sub(1);
     logv(o, "udp: session %s closed (%s)", key.c_str(), why);
   };
 
@@ -546,12 +762,14 @@ static int run_udp(const Options& o) {
     ses.last = std::chrono::steady_clock::now();
     byKey.emplace(key, std::move(ses));
     bySock.emplace(s, key);
+    g_active_udp.fetch_add(1);
+    g_stats.udp_sessions_created.fetch_add(1);
     logv(o, "udp: new session %s -> %s:%d", key.c_str(),
          o.target_host.c_str(), o.target_port);
     return true;
   };
 
-  while (!g_stop.load()) {
+  while (!g_stop.load() && !ctx->stop.load()) {
     // 空闲超时清扫
     auto now = std::chrono::steady_clock::now();
     for (auto it = byKey.begin(); it != byKey.end();) {
@@ -561,6 +779,7 @@ static int run_udp(const Options& o) {
         closesock(it->second.s);
         bySock.erase(it->second.s);
         it = byKey.erase(it);
+        g_active_udp.fetch_sub(1);
       } else ++it;
     }
 
@@ -570,17 +789,19 @@ static int run_udp(const Options& o) {
     for (auto& kv : bySock) pfds.push_back(pollfd{ kv.first, POLLIN, 0 });
 
     int r = xpoll(pfds.data(), (unsigned long)pfds.size(), 1000);
-    if (g_stop.load()) break;
+    if (g_stop.load() || ctx->stop.load()) break;
     if (r < 0) {
       if (SOCK_ERRNO() == E_INTR) continue;
-      logline("udp: poll error: %s", sockerr_str().c_str());
+      logw("udp: poll error: %s", sockerr_str().c_str());
       break;
     }
     if (r == 0) continue;
 
     // ---- 监听口有数据: 客户端 -> 目标 ----
+    // 每轮每句柄只处理 batch 个就停, 让其它会话的回包能在同一轮被处理, 避免
+    // 单个高频客户端独占 poll 循环(饿死其它会话)。
     if (pfds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
-      for (;;) {
+      for (int served = 0; served < batch; ++served) {
         sockaddr_storage src{};
         socklen_t sl = sizeof(src);
         int n = (int)recvfrom(listener, buf.data(), (int)buf.size(), 0,
@@ -594,6 +815,7 @@ static int run_udp(const Options& o) {
         auto it = byKey.find(key);
         if (it == byKey.end()) {
           if (!make_session(src, sl, key)) {
+            g_stats.udp_dropped.fetch_add(1);
             logv(o, "udp: drop datagram from %s (session create failed/full)", key.c_str());
             continue;
           }
@@ -603,10 +825,11 @@ static int run_udp(const Options& o) {
         int w = (int)send(it->second.s, buf.data(), n, 0);   // 已 connect, 直发目标
         if (w < 0) {
           int e = SOCK_ERRNO();
-          if (e == E_WOULDBLOCK) { /* 内核缓冲满, 丢包(无损下界由 -b 缓冲兜底) */ }
+          if (e == E_WOULDBLOCK) { g_stats.udp_dropped.fetch_add(1); }  // 内核缓冲满
           else { erase_session(key, "send error"); }
           continue;
         }
+        g_stats.udp_dgrams_in.fetch_add(1);
         it->second.last = std::chrono::steady_clock::now();
       }
     }
@@ -617,10 +840,11 @@ static int run_udp(const Options& o) {
       sock_t ss = pfds[i].fd;
       auto sk = bySock.find(ss);
       if (sk == bySock.end()) continue;          // 本迭代内已回收
-      const std::string& key = sk->second;
+      // 拷贝 key: erase_session 会删掉 bySock 里的同名元素, 不能持引用(否则悬垂)
+      const std::string key = sk->second;
       auto it = byKey.find(key);
       if (it == byKey.end()) continue;
-      for (;;) {
+      for (int served = 0; served < batch; ++served) {
         int n = (int)recv(ss, buf.data(), (int)buf.size(), 0);
         if (n < 0) {
           if (SOCK_ERRNO() == E_WOULDBLOCK) break;
@@ -632,25 +856,30 @@ static int run_udp(const Options& o) {
                             (const sockaddr*)&it->second.client, it->second.clen);
         if (w < 0) {
           if (SOCK_ERRNO() != E_WOULDBLOCK) break;
-          /* 缓冲满丢弃该回包 */
+          g_stats.udp_dropped.fetch_add(1);       // 缓冲满丢弃该回包
         } else {
+          g_stats.udp_dgrams_out.fetch_add(1);
           it->second.last = std::chrono::steady_clock::now();
         }
       }
     }
   }
 
+  // 停机: 回收全部会话(UDP 无连接, 无在途半关闭, 直接释放)
+  const int left = (int)byKey.size();
   for (auto& kv : byKey) closesock(kv.second.s);
   byKey.clear(); bySock.clear();
+  g_active_udp.fetch_sub(left);
+  if (g_active_udp.load() < 0) g_active_udp.store(0);
   closesock(listener);
-  logline("UDP relay stopped");
+  logline("UDP relay stopped (closed %d session(s))", left);
   return 0;
 }
 
 // ----------------------------------------------------------------------------
 // 启动参数解析: 位置写法 / 命名写法 / 规则写法 / 配置文件, 可混用且支持多规则
 // ----------------------------------------------------------------------------
-static const char* kVersion = "1.1.0";
+static const char* kVersion = "1.2.0";
 
 struct ParseState {
   std::vector<Options>     rules;    // 已解析完成的转发规则(可多条)
@@ -658,10 +887,21 @@ struct ParseState {
   bool help = false, version = false;
 
   // 选项默认值: 写在规则前的选项也作为其后规则的默认值
-  int  sockbuf_kb = 256;
-  int  udp_timeout = 60;
-  int  udp_max = 1024;
-  bool verbose = false;
+  int  sockbuf_kb   = 256;
+  int  udp_timeout  = 60;
+  int  udp_max      = 1024;
+  int  udp_batch    = 64;
+  int  max_conns    = 1024;
+  int  keepalive    = 0;
+  int  idle_timeout = 0;
+  bool verbose      = false;
+
+  // 全局运行项(与具体规则无关)
+  bool has_log_level   = false;
+  int  log_level       = LOG_INFO;
+  std::string log_file;
+  int  stats_interval  = 0;
+  int  drain_timeout   = 5;
 
   // 当前正在累积的规则
   bool has_mode = false, has_lport = false, has_thost = false, has_tport = false, has_lhost = false;
@@ -809,6 +1049,10 @@ static bool flush_rule(ParseState& st, std::string& err) {
   o.sockbuf_kb  = st.sockbuf_kb;
   o.udp_timeout = st.udp_timeout;
   o.udp_max     = st.udp_max;
+  o.udp_batch   = st.udp_batch;
+  o.max_conns   = st.max_conns;
+  o.keepalive   = st.keepalive;
+  o.idle_timeout = st.idle_timeout;
   o.verbose     = st.verbose;
   st.rules.push_back(o);
   st.has_mode = st.has_lport = st.has_thost = st.has_tport = st.has_lhost = false;
@@ -893,7 +1137,11 @@ static bool feed_tokens(const std::vector<std::string>& in, ParseState& st, std:
     if (a == "--") continue;
     if (a == "-h" || a == "--help" || a == "-?")    { st.help = true; continue; }
     if (a == "-V" || a == "--version")              { st.version = true; continue; }
-    if (a == "-v" || a == "--verbose")              { st.verbose = true; continue; }
+    if (a == "-v" || a == "--verbose") {
+      st.verbose = true;
+      if (!st.has_log_level) st.log_level = LOG_DEBUG;   // -v 等价于日志级别 debug
+      continue;
+    }
 
     if (a == "-b" || a == "--buf-kb" || a == "--buffer" || a == "--buf") {
       if (!need_val("--buf-kb")) return false;
@@ -914,6 +1162,63 @@ static bool feed_tokens(const std::vector<std::string>& in, ParseState& st, std:
       int v = 0;
       if (!parse_int_val(t[i], v)) { err = "会话上限非法: " + t[i]; return false; }
       st.udp_max = v;
+      continue;
+    }
+    if (a == "--udp-batch") {
+      if (!need_val("--udp-batch")) return false;
+      int v = 0;
+      if (!parse_int_val(t[i], v)) { err = "UDP 批量非法: " + t[i]; return false; }
+      st.udp_batch = v;
+      continue;
+    }
+    if (a == "--max-conns" || a == "--max-connections") {
+      if (!need_val("--max-conns")) return false;
+      int v = 0;
+      if (!parse_int_val(t[i], v)) { err = "并发连接上限非法: " + t[i]; return false; }
+      st.max_conns = v;
+      continue;
+    }
+    if (a == "--keepalive" || a == "--keep-alive") {
+      if (!need_val("--keepalive")) return false;
+      int v = 0;
+      if (!parse_int_val(t[i], v)) { err = "keepalive 秒数非法: " + t[i]; return false; }
+      st.keepalive = v;
+      continue;
+    }
+    if (a == "--idle-timeout") {
+      if (!need_val("--idle-timeout")) return false;
+      int v = 0;
+      if (!parse_int_val(t[i], v)) { err = "空闲超时非法: " + t[i]; return false; }
+      st.idle_timeout = v;
+      continue;
+    }
+    if (a == "--log-level") {
+      if (!need_val("--log-level")) return false;
+      int lv = 0;
+      if (!parse_log_level(t[i], lv)) {
+        err = "日志级别非法(应为 error|warn|info|debug): " + t[i];
+        return false;
+      }
+      st.log_level = lv; st.has_log_level = true;
+      continue;
+    }
+    if (a == "--log-file") {
+      if (!need_val("--log-file")) return false;
+      st.log_file = t[i];
+      continue;
+    }
+    if (a == "--stats-interval") {
+      if (!need_val("--stats-interval")) return false;
+      int v = 0;
+      if (!parse_int_val(t[i], v)) { err = "统计间隔非法: " + t[i]; return false; }
+      st.stats_interval = v;
+      continue;
+    }
+    if (a == "--drain-timeout") {
+      if (!need_val("--drain-timeout")) return false;
+      int v = 0;
+      if (!parse_int_val(t[i], v)) { err = "drain 超时非法: " + t[i]; return false; }
+      st.drain_timeout = v;
       continue;
     }
     if (a == "-f" || a == "--config" || a == "--conf" || a == "--include") {
@@ -1011,6 +1316,14 @@ static const ConfigKey kConfigKeys[] = {
   {"buf-kb",      "--buf-kb"},      {"buffer",      "--buf-kb"},    {"buf",  "--buf-kb"},
   {"udp-timeout", "--udp-timeout"}, {"timeout",     "--udp-timeout"},
   {"udp-max",     "--udp-max"},     {"max",         "--udp-max"},   {"max-sessions", "--udp-max"},
+  {"udp-batch",   "--udp-batch"},   {"batch",       "--udp-batch"},
+  {"max-conns",   "--max-conns"},   {"max-connections", "--max-conns"},
+  {"keepalive",   "--keepalive"},   {"keep-alive",  "--keepalive"},
+  {"idle-timeout","--idle-timeout"},
+  {"log-level",   "--log-level"},   {"loglevel",    "--log-level"},
+  {"log-file",    "--log-file"},    {"logfile",     "--log-file"},
+  {"stats-interval", "--stats-interval"},
+  {"drain-timeout",  "--drain-timeout"},
   {"verbose",     "--verbose"},
   {"rule",        "--rule"},
   {"config",      "--config"},      {"include",     "--config"},
@@ -1089,8 +1402,8 @@ static bool load_config_file(const std::string& path, ParseState& st, std::strin
   return true;
 }
 
-static int run_rule(const Options& o) {
-  return (o.mode == "tcp") ? run_tcp(o) : run_udp(o);
+static int run_rule(const Options& o, RuleCtx* ctx) {
+  return (o.mode == "tcp") ? run_tcp(o, ctx) : run_udp(o, ctx);
 }
 
 // ----------------------------------------------------------------------------
@@ -1099,11 +1412,16 @@ static int run_rule(const Options& o) {
 #ifdef _WIN32
 static BOOL WINAPI ctrl_handler(DWORD type) {
   (void)type;
-  g_stop.store(true);
-  return TRUE;   // 阻止默认终止, 由主循环优雅退出
+  g_signal_count.fetch_add(1);
+  g_stop.store(true);           // 阻止默认终止, 由主循环优雅退出(第二次 Ctrl+C 强制)
+  return TRUE;
 }
 #else
-static void sig_handler(int) { g_stop.store(true); }
+static void sig_handler(int sig) {
+  if (sig == SIGHUP) { g_reload.store(true); return; }   // 热重载请求
+  g_signal_count.fetch_add(1);
+  g_stop.store(true);           // 第一次 = 优雅停机(drain), 第二次 = 立即退出
+}
 #endif
 
 static void usage(FILE* f) {
@@ -1143,7 +1461,15 @@ static void usage(FILE* f) {
     "  -b, --buf-kb KB          内核收发缓冲大小(KB), 默认 256\n"
     "  -u, --udp-timeout sec    UDP 空闲会话超时秒数, 默认 60\n"
     "  -m, --udp-max max        UDP 最大并发会话数, 默认 1024(超限按 LRU 驱逐)\n"
-    "  -v, --verbose            详细日志(新连接/会话开关等)\n"
+    "      --udp-batch N        UDP 单轮每会话最多处理的数据报数, 默认 64(0=不限)\n"
+    "      --max-conns N        TCP 最大并发连接数, 默认 1024(0=不限)\n"
+    "      --keepalive sec      TCP keepalive: 空闲 sec 秒后开始探测, 默认 0(关闭)\n"
+    "      --idle-timeout sec   TCP 双向空闲超时秒数, 超时断开, 默认 0(关闭)\n"
+    "      --drain-timeout sec  优雅停机等待在途连接的上限秒数, 默认 5\n"
+    "      --log-level LVL      日志级别 error|warn|info|debug, 默认 info\n"
+    "      --log-file FILE      日志写入文件(默认 stdout)\n"
+    "      --stats-interval sec 每 sec 秒打印一次运行统计, 默认 0(关闭)\n"
+    "  -v, --verbose            详细日志(等价于 --log-level debug)\n"
     "  -h, --help               显示本帮助\n"
     "  -V, --version            显示版本\n"
     "\n"
@@ -1160,6 +1486,15 @@ static void usage(FILE* f) {
     kVersion);
 }
 
+// 规则运行器: 每条规则一个线程 + 独立停止/在途连接状态, 支持热重载时单独增删
+struct RuleRunner {
+  Options        opts;
+  std::string    spec;
+  RuleCtx        ctx;
+  std::thread    th;
+};
+
+#ifndef PORTRELAY_NO_MAIN   // 单元测试通过 -DPORTRELAY_NO_MAIN + #include 复用本文件
 int main(int argc, char** argv) {
 #ifdef _WIN32
   WSADATA wsa;
@@ -1171,10 +1506,11 @@ int main(int argc, char** argv) {
 #else
   std::signal(SIGINT, sig_handler);
   std::signal(SIGTERM, sig_handler);
+  std::signal(SIGHUP, sig_handler);          // 热重载
 #endif
 
   auto bad = [&](const std::string& msg) {
-    logline("error: %s", msg.c_str());
+    loge("error: %s", msg.c_str());
     usage(stderr);
 #ifdef _WIN32
     WSACleanup();
@@ -1182,19 +1518,18 @@ int main(int argc, char** argv) {
     return 1;
   };
 
-  ParseState st;
-  std::string err;
-  std::vector<std::string> toks;
-  for (int i = 1; i < argc; ++i) toks.push_back(argv[i]);
+  std::vector<std::string> cli_tokens;
+  for (int i = 1; i < argc; ++i) cli_tokens.push_back(argv[i]);
+  std::vector<std::string> extra_configs;    // 无参启动时自动加载的默认配置
 
   // 不带任何参数启动时, 尝试读取 exe 同目录的 portrelay.conf (双击启动友好)
-  if (toks.empty()) {
+  if (cli_tokens.empty()) {
     std::string def = exe_dir(argv[0]) + "/portrelay.conf";
     if (file_exists_(def)) {
       logline("no arguments: using default config %s", def.c_str());
-      st.configs.push_back(def);
+      extra_configs.push_back(def);
     } else {
-      logline("error: 未提供任何参数, 且未找到默认配置文件 %s", def.c_str());
+      loge("error: 未提供任何参数, 且未找到默认配置文件 %s", def.c_str());
       usage(stderr);
 #ifdef _WIN32
       WSACleanup();
@@ -1203,63 +1538,187 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (!feed_tokens(toks, st, err)) return bad(err);
-  if (st.help) { usage(stdout); return 0; }
-  if (st.version) {
+  // 先解析一次: 仅用于处理 --help/--version
+  ParseState boot;
+  std::string err;
+  if (!feed_tokens(cli_tokens, boot, err)) return bad(err);
+  if (boot.help)    { usage(stdout); return 0; }
+  if (boot.version) {
     std::printf("portrelay %s\n", kVersion);
 #ifdef _WIN32
     WSACleanup();
 #endif
     return 0;
   }
-  if (!flush_rule(st, err)) return bad(err);
 
-  // 配置文件队列(按出现顺序加载, 上限 8 个防循环包含)
-  for (size_t ci = 0; ci < st.configs.size(); ++ci) {
-    if (ci >= 8) { logline("warning: 配置文件层数过多, 已忽略后续文件"); break; }
-    if (!load_config_file(st.configs[ci], st, err)) return bad(err);
-    if (st.help) { usage(stdout); return 0; }
-    if (st.version) {
-      std::printf("portrelay %s\n", kVersion);
-#ifdef _WIN32
-      WSACleanup();
-#endif
-      return 0;
+  // 把"命令行 + 配置文件"完整解析为规则集(首次启动与热重载共用同一路径,
+  // 保证重载结果与冷启动完全一致), 同时应用其中的全局设置。
+  auto build_rules = [&](std::vector<Options>& out, std::string& e) -> bool {
+    ParseState ns;
+    if (!feed_tokens(cli_tokens, ns, e)) return false;
+    if (!flush_rule(ns, e)) return false;
+    std::vector<std::string> cfgs = ns.configs;
+    for (const std::string& c : extra_configs) cfgs.push_back(c);
+    for (size_t ci = 0; ci < cfgs.size(); ++ci) {
+      if (ci >= 8) { logw("warning: 配置文件层数过多, 已忽略后续文件"); break; }
+      if (!load_config_file(cfgs[ci], ns, e)) return false;
     }
+    if (ns.rules.empty()) { e = "未解析到任何转发规则"; return false; }
+    for (Options& o : ns.rules) {
+      if (o.mode != "tcp" && o.mode != "udp") { e = "模式必须为 tcp 或 udp: " + o.mode; return false; }
+      if (o.listen_port <= 0 || o.listen_port > 65535)
+        { e = "监听端口非法: " + std::to_string(o.listen_port); return false; }
+      if (o.target_port <= 0 || o.target_port > 65535)
+        { e = "目标端口非法: " + std::to_string(o.target_port); return false; }
+      if (o.target_host.empty()) { e = "目标主机为空"; return false; }
+      if (o.sockbuf_kb < 8) o.sockbuf_kb = 8;
+      if (o.udp_timeout <= 0) o.udp_timeout = 60;
+      if (o.udp_max < 1) o.udp_max = 1024;
+      if (o.udp_batch < 0) o.udp_batch = 0;
+      if (o.max_conns < 0) o.max_conns = 0;
+      if (o.keepalive < 0) o.keepalive = 0;
+      if (o.idle_timeout < 0) o.idle_timeout = 0;
+    }
+    out = std::move(ns.rules);
+    // 任一规则开启了 verbose 且未显式指定日志级别 -> 视为 debug
+    if (!ns.has_log_level) {
+      for (const Options& o : out)
+        if (o.verbose) { ns.log_level = LOG_DEBUG; break; }
+    }
+    g_stats_interval.store(ns.stats_interval > 0 ? ns.stats_interval : 0);
+    g_drain_timeout.store(ns.drain_timeout >= 0 ? ns.drain_timeout : 0);
+    g_log_level.store(ns.log_level);
+    if (!ns.log_file.empty()) open_log_file(ns.log_file);
+    return true;
+  };
+
+  std::vector<Options> rules;
+  if (!build_rules(rules, err)) return bad(err);
+
+  logline("启动 %zu 条转发规则 (Ctrl+C 停止):", rules.size());
+  for (const Options& o : rules)
+    logline("  %s  %s:%d -> %s:%d%s", o.mode.c_str(),
+            o.listen_host.empty() ? "0.0.0.0" : o.listen_host.c_str(), o.listen_port,
+            o.target_host.c_str(), o.target_port, o.verbose ? "  [verbose]" : "");
+#ifndef _WIN32
+  logline("提示: 发送 SIGHUP(kill -HUP %d) 可热重载配置, Ctrl+C 优雅退出(第二次立即退出)",
+          (int)getpid());
+#endif
+
+  std::vector<std::unique_ptr<RuleRunner>> runners;
+
+  auto make_runner = [&](const Options& o) -> std::unique_ptr<RuleRunner> {
+    auto rr = std::make_unique<RuleRunner>();
+    rr->opts = o;
+    rr->spec = rule_spec(o);
+    RuleRunner* raw = rr.get();
+    g_runners_alive.fetch_add(1);
+    try {
+      raw->th = std::thread([raw] {
+        int rc = run_rule(raw->opts, &raw->ctx);
+        if (rc != 0) g_exit_code.store(rc);
+        g_runners_alive.fetch_sub(1);
+      });
+    } catch (const std::exception& ex) {
+      logw("warning: cannot spawn rule thread (%s)", ex.what());
+      g_runners_alive.fetch_sub(1);
+      return nullptr;
+    }
+    return rr;
+  };
+  auto stop_runner = [&](std::unique_ptr<RuleRunner>& rr) {
+    if (!rr) return;
+    rr->ctx.stop.store(true);
+    if (rr->th.joinable()) rr->th.join();
+  };
+
+  for (const Options& o : rules) {
+    auto rr = make_runner(o);
+    if (!rr) return bad("无法为规则创建线程");
+    runners.push_back(std::move(rr));
   }
 
-  if (st.rules.empty()) return bad("未解析到任何转发规则");
+  // 周期统计线程(间隔为 0 时仅空转)
+  std::thread stats_th([&] {
+    while (!g_stop.load()) {
+      int iv = g_stats_interval.load();
+      if (iv <= 0) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); continue; }
+      for (int i = 0; i < iv * 10 && !g_stop.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (g_stop.load()) break;
+      log_stats();
+    }
+  });
 
-  // 规范化 / 校验每条规则
-  for (Options& o : st.rules) {
-    if (o.mode != "tcp" && o.mode != "udp") return bad("模式必须为 tcp 或 udp: " + o.mode);
-    if (o.listen_port <= 0 || o.listen_port > 65535)
-      return bad("监听端口非法: " + std::to_string(o.listen_port));
-    if (o.target_port <= 0 || o.target_port > 65535)
-      return bad("目标端口非法: " + std::to_string(o.target_port));
-    if (o.target_host.empty()) return bad("目标主机为空");
-    if (o.sockbuf_kb < 8) o.sockbuf_kb = 8;
-    if (o.udp_timeout <= 0) o.udp_timeout = 60;
-    if (o.udp_max < 1) o.udp_max = 1024;
+  // 主循环: 等待退出信号; 期间响应 SIGHUP 热重载
+  while (!g_stop.load() && g_runners_alive.load() > 0) {
+    if (g_reload.exchange(false)) {
+      std::vector<Options> nr;
+      std::string e;
+      if (!build_rules(nr, e)) {
+        logw("warning: 热重载失败, 保持现有规则: %s", e.c_str());
+      } else {
+        // 1) 先算出哪些新规则可复用现有运行器(完全未变), 其余需要新建
+        std::vector<bool>  keep(runners.size(), false);
+        std::vector<Options> toStart;
+        int kept = 0;
+        for (const Options& o : nr) {
+          std::string s = rule_spec(o);
+          int found = -1;
+          for (size_t i = 0; i < runners.size(); ++i)
+            if (!keep[i] && runners[i] && runners[i]->spec == s) { found = (int)i; break; }
+          if (found >= 0) { keep[(size_t)found] = true; ++kept; }
+          else            { toStart.push_back(o); }
+        }
+        // 2) 先停掉被替换/删除的旧规则(join 后端口才释放), 再启动新规则, 避免同端口 bind 冲突
+        int stopped = 0;
+        for (size_t i = 0; i < runners.size(); ++i) {
+          if (!keep[i] && runners[i]) {
+            logline("reload: stopping rule %s", runners[i]->spec.c_str());
+            stop_runner(runners[i]);
+            runners[i].reset();
+            ++stopped;
+          }
+        }
+        // 3) 按新规则顺序重组: 保留未变的 + 新建变化的
+        std::vector<std::unique_ptr<RuleRunner>> next;
+        for (const Options& o : nr) {
+          std::string s = rule_spec(o);
+          bool took = false;
+          for (size_t i = 0; i < runners.size(); ++i)
+            if (keep[i] && runners[i] && runners[i]->spec == s) {
+              next.push_back(std::move(runners[i]));
+              keep[i] = false; took = true; break;
+            }
+          if (!took) {
+            logline("reload: starting rule %s", s.c_str());
+            auto rr = make_runner(o);
+            if (rr) next.push_back(std::move(rr));
+          }
+        }
+        const int started = (int)toStart.size();
+        runners = std::move(next);
+        logline("reload: done (kept %d, started %d, stopped %d)", kept, started, stopped);
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
 
-  int rc = 0;
-  if (st.rules.size() == 1) {
-    rc = run_rule(st.rules[0]);
-  } else {
-    logline("启动 %zu 条转发规则 (Ctrl+C 停止):", st.rules.size());
-    for (const Options& o : st.rules)
-      logline("  %s  %s:%d -> %s:%d", o.mode.c_str(),
-              o.listen_host.empty() ? "0.0.0.0" : o.listen_host.c_str(), o.listen_port,
-              o.target_host.c_str(), o.target_port);
-    std::vector<std::thread> ths;
-    ths.reserve(st.rules.size());
-    for (const Options& o : st.rules) ths.emplace_back([&o] { run_rule(o); });
-    for (std::thread& th : ths) th.join();
-  }
+  // 退出: 通知所有规则停止并等待其 drain 完成
+  g_stop.store(true);
+  if (stats_th.joinable()) stats_th.join();
+  for (auto& rr : runners) stop_runner(rr);
+  runners.clear();
 
+  log_stats();
+  logline("portrelay exiting (code %d)", g_exit_code.load());
+  {
+    std::lock_guard<std::mutex> lk(g_log_mu);
+    if (g_log_fp) { std::fclose(g_log_fp); g_log_fp = nullptr; }
+  }
 #ifdef _WIN32
   WSACleanup();
 #endif
-  return rc;
+  return g_exit_code.load();
 }
+#endif  // PORTRELAY_NO_MAIN
