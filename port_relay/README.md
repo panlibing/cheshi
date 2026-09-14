@@ -1,6 +1,6 @@
 # portrelay —— TCP / UDP 端口无损转发工具（C++17 单文件）
 
-版本 `1.1.0`｜Windows / Linux / macOS｜单文件、无第三方依赖
+版本 `1.2.0`｜Windows / Linux / macOS｜单文件、无第三方依赖
 
 一个把本地某个端口收到的流量**原样、不解析、不修改**地转发到远端
 `目标主机:目标端口` 的小工具，TCP 与 UDP 双协议。
@@ -14,9 +14,14 @@
 | UDP 无损语义 | 每个数据报**原样转发，保持报文边界**（不粘包/拆包、不改字节）；回包按“源客户端会话”准确路由，多客户端互不串扰 |
 | UDP 会话管理 | 空闲会话超时自动回收（`-u`）；会话数上限 + LRU 驱逐（`-m`），防资源耗尽 |
 | 内核缓冲可调 | `-b KB` 调大 SO_RCVBUF/SO_SNDBUF，降低突发流量下的用户态丢包 |
+| TCP 连接上限 | `--max-conns N` 限制并发连接数，超限直接拒绝，防止线程数失控拖垮整机 |
+| TCP 僵死回收 | `--keepalive sec` 开内核 keepalive；`--idle-timeout sec` 双向空闲超时断开 |
+| UDP 公平性 | `--udp-batch N` 限制单轮每会话处理的数据报数，避免高频客户端饿死其它会话 |
 | 回包地址透明 | UDP 回包经监听套接字发回，客户端看到的数据来源恒为“监听地址:监听端口” |
 | 双栈 | 监听/目标支持 IPv4、IPv6 字面量或域名（自动 getaddrinfo） |
-| 优雅退出 | Ctrl+C 在 1 秒内完成清理退出（Windows 控制台处理器 / POSIX 信号） |
+| 可观测 | `--stats-interval sec` 周期打印运行统计；`--log-level`/`--log-file` 分级日志与落盘 |
+| 优雅退出 | Ctrl+C 先停止接收新连接，再在 `--drain-timeout` 秒内等待在途连接自然结束（第二次 Ctrl+C 立即退出） |
+| 热重载 | POSIX 下发送 SIGHUP 重读配置文件，只重启发生变化的规则（`kill -HUP <pid>`） |
 
 > “无损”的含义：转发层不改动任何载荷字节、TCP 保持可靠流语义、UDP 保持报文
 > 边界不合并拆分。UDP 本身是尽力而为协议，跨网络丢包由传输层决定；本工具通过
@@ -89,7 +94,15 @@ cl /nologo /O2 /std:c++17 /EHsc /utf-8 /W3 portrelay.cpp ws2_32.lib /Fe:portrela
 | `-b`, `--buf-kb` KB | 内核收发缓冲大小（KB），默认 256 |
 | `-u`, `--udp-timeout` sec | UDP 空闲会话超时秒数，默认 60 |
 | `-m`, `--udp-max` max | UDP 最大并发会话数，默认 1024（超限按 LRU 驱逐） |
-| `-v`, `--verbose` | 详细日志（新连接/会话开关等） |
+| `--udp-batch` N | UDP 单轮每个会话最多处理的数据报数，默认 64（`0` = 不限） |
+| `--max-conns` N | TCP 最大并发连接数，默认 1024（`0` = 不限） |
+| `--keepalive` sec | TCP keepalive：空闲 `sec` 秒后开始探测，默认 0（关闭） |
+| `--idle-timeout` sec | TCP 双向空闲超时秒数，超时断开，默认 0（关闭） |
+| `--drain-timeout` sec | 优雅停机时等待在途连接结束的上限秒数，默认 5 |
+| `--log-level` LVL | 日志级别 `error` \| `warn` \| `info` \| `debug`，默认 `info` |
+| `--log-file` FILE | 日志写入文件（默认写 stdout） |
+| `--stats-interval` sec | 每 `sec` 秒打印一次运行统计，默认 0（关闭） |
+| `-v`, `--verbose` | 详细日志（等价于 `--log-level debug`） |
 | `-h`, `--help` | 显示帮助 |
 | `-V`, `--version` | 显示版本 |
 
@@ -105,7 +118,8 @@ cl /nologo /O2 /std:c++17 /EHsc /utf-8 /W3 portrelay.cpp ws2_32.lib /Fe:portrela
 每行一条与命令行等价的规则（位置写法最直观），`#` 或 `;` 起始为注释；
 也识别 `key=value` 键：`mode` / `listen` / `listen-port` / `listen-host` /
 `target` / `target-host` / `target-port` / `buf-kb` / `udp-timeout` /
-`udp-max` / `verbose`。
+`udp-max` / `udp-batch` / `max-conns` / `keepalive` / `idle-timeout` /
+`log-level` / `log-file` / `stats-interval` / `drain-timeout` / `verbose`。
 
 注意：**配置文件按行独立结算**——每读到一行就立即生成一条规则，因此
 `mode=tcp`、`listen=9000` 这样把一条规则拆到多行的写法会报
@@ -156,12 +170,14 @@ UDP 无连接、多客户端可共用同一监听端口。若简单地把收到�
 ### Linux / macOS / CI（bash，推荐）
 
 脚本自带客户端探针（`tests/probe.cpp`，纯 C++17，不依赖 python/nc），会自行
-编译 `portrelay`、`tests/echo`、`tests/probe`：
+编译 `portrelay`、`tests/echo`、`tests/probe`、`tests/unit_tests`：
 
 ```sh
 bash port_relay/tests/run_tests.sh              # 退出码 0 = 全过, 1 = 有失败
 FORCE_BUILD=1 bash port_relay/tests/run_tests.sh   # 强制重新编译
 CXX=clang++ bash port_relay/tests/run_tests.sh     # 指定编译器
+WERROR=1 bash port_relay/tests/run_tests.sh        # 告警即失败(CI 用)
+SANITIZE=1 FORCE_BUILD=1 bash port_relay/tests/run_tests.sh   # ASan + UBSan
 ```
 
 覆盖范围：
@@ -171,6 +187,7 @@ CXX=clang++ bash port_relay/tests/run_tests.sh     # 指定编译器
 - **C) 默认配置** —— 不带参数启动时自动加载可执行文件同目录的 `portrelay.conf`
 - **D) 帮助与错误分支** —— `-h` / `-V` 输出；非法 mode、端口越界、坏规则串、配置文件不存在等必须被拒绝并给出可读错误
 - **E) 文档同步** —— README 与 `-h` 的长选项集合双向比对，并校验文件树里的行数标注（源码行数变了而文档没跟，直接失败）
+- **F) 单元测试** —— `tests/unit_tests.cpp`：纯函数（HostPort/规则串/配置行解析、日志级别、规则规范化）逐项断言 + 配置解析 fuzz（确定性伪随机冲刷解析入口，配合 ASan/UBSan 抓越界/未定义行为）
 
 只做文档同步检查（不需要编译器，直接用已构建的二进制）：
 
@@ -183,8 +200,8 @@ bash port_relay/tests/check_docs_sync.sh port_relay/portrelay.exe
 
 ```bat
 cd port_relay
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\build.bat
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_tests.ps1
+tests\build.bat                                      :: 构建 echo/probe/unit_tests
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_tests.ps1      :: 含单元测试
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_args_tests.ps1
 ```
 
@@ -195,29 +212,46 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_args_tests.ps1
 
 | 作业 | 平台 | 内容 |
 |---|---|---|
-| `linux-build-test` | `ubuntu-latest` × {g++, clang++} | `bash build.sh` → `tests/check_docs_sync.sh` → `tests/run_tests.sh`（A~E 全部分段） |
-| `macos-build-test` | `macos-latest`（clang++） | 同上 |
-| `windows-build-test` | `windows-latest`（MSVC） | `build.bat` + `tests\build.bat` → `check_docs_sync.sh`（Git Bash）→ `run_tests.ps1` → `run_args_tests.ps1` |
+| `linux-build-test` | `ubuntu-latest` × {g++, clang++} | `WERROR=1 bash build.sh` → `tests/check_docs_sync.sh` → `tests/run_tests.sh`（A~F 全部分段） |
+| `macos-build-test` | `macos-latest`（clang++） | 同上（`-Werror`） |
+| `sanitizers` | `ubuntu-latest`（g++） | `SANITIZE=1` 构建 AddressSanitizer + UndefinedBehaviorSanitizer，跑完整 `tests/run_tests.sh`，抓越界/释放后使用/未定义行为 |
+| `windows-build-test` | `windows-latest`（MSVC） | `build.bat` + `tests\build.bat` → `check_docs_sync.sh`（Git Bash）→ `run_tests.ps1`（含单元测试）→ `run_args_tests.ps1` |
 
-每个作业编译前先对所有 shell 脚本做 `bash -n` 语法检查；三平台都会执行
-`tests/check_docs_sync.sh`，因此 README 的长选项集合或文件树行数标注一旦与源码
-漂移，CI 立刻失败。失败时还会 `ls -l` 打印产物信息便于定位。
+Linux/macOS 作业以 `WERROR=1` 严格编译；每个作业编译前先对所有 shell 脚本做
+`bash -n` 语法检查；三平台都会执行 `tests/check_docs_sync.sh`，因此 README 的长
+选项集合或文件树行数标注一旦与源码漂移，CI 立刻失败。失败时还会 `ls -l` 打印
+产物信息便于定位。
+
+### 提交卫生（.githooks）
+
+仓库启用了 `core.hooksPath=.githooks`：
+
+- `pre-commit` —— 暂存脚本 `bash -n` 语法检查 + README 行数标注一致性（存在已
+  构建的二进制时再做 README 与 `-h` 的选项双向比对）；
+- `commit-msg` —— 校验约定式提交（Conventional Commits）首行格式。
+
+已克隆的仓库若 `core.hooksPath` 未生效，执行一次：
+
+```sh
+git config core.hooksPath .githooks
+```
 
 ## 文件
 
 ```
 port_relay/
-├─ portrelay.cpp            主程序(单文件, 1265 行)
+├─ portrelay.cpp            主程序(单文件, 1724 行)
 ├─ build.bat                Windows MSVC 构建脚本
-├─ build.sh                 Linux/macOS 构建脚本
+├─ build.sh                 Linux/macOS 构建脚本(支持 CXXFLAGS/WERROR/SANITIZE)
 ├─ README.md                本说明
 └─ tests/
-   ├─ echo.cpp              自测用 TCP/UDP 回声服务器(88 行)
+   ├─ echo.cpp              自测用 TCP/UDP 回声服务器(90 行)
    ├─ probe.cpp             跨平台自测客户端探针(233 行)
-   ├─ build.bat             tests 下辅助程序的构建脚本
-   ├─ run_tests.sh          端到端自测: Linux/macOS/CI(236 行)
+   ├─ unit_tests.cpp        单元测试: 纯函数 + 配置解析 fuzz(270 行)
+   ├─ build.bat             tests 下辅助程序(echo/probe/unit_tests)的构建脚本
+   ├─ run_tests.sh          端到端自测: Linux/macOS/CI(255 行)
    ├─ check_docs_sync.sh    README 与 -h 选项/行数标注一致性检查(88 行)
-   ├─ run_tests.ps1         Windows 端到端自测(PowerShell)
+   ├─ run_tests.ps1         Windows 端到端自测(含单元测试)(PowerShell)
    ├─ run_args_tests.ps1    Windows 参数/错误分支自测(PowerShell)
    ├─ diag.ps1              Windows 快速诊断(PowerShell)
    └─ multi_rule_demo.ps1   多规则演示(PowerShell)
