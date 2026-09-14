@@ -1,0 +1,40 @@
+#!/bin/sh
+# ============================================================================
+# commit-msg: 约定式提交(Conventional Commits)格式校验
+#
+#   形如:  <type>(<scope>): <subject>
+#   type:  feat|fix|chore|docs|test|refactor|perf|build|ci|style|revert|wip
+#
+#   放行:  Merge / Revert / fixup! / squash! 等自动生成的消息。
+#   跳过:  git commit --no-verify
+# ============================================================================
+set -u
+
+msgfile="${1:-}"
+[ -n "$msgfile" ] && [ -f "$msgfile" ] || exit 0
+
+# 取首行(忽略以 # 开头的注释行)
+subject="$(grep -v '^#' "$msgfile" | sed '/^[[:space:]]*$/d' | head -n 1)"
+
+# 放行自动生成的合并/fixup 消息
+case "$subject" in
+  Merge*|Revert*|fixup!*|squash!*) exit 0 ;;
+esac
+
+# 允许空提交说明(极少数场景)
+[ -n "$subject" ] || exit 0
+
+re='^(feat|fix|chore|docs|test|refactor|perf|build|ci|style|revert|wip)(\([A-Za-z0-9._/-]+\))?!?: .+'
+if ! printf '%s\n' "$subject" | grep -Eq "$re"; then
+  echo "[commit-msg] 提交信息不符合约定式提交格式:" >&2
+  echo "  $subject" >&2
+  echo "  期望: <type>(<scope>): <subject>  (type 见钩子注释)" >&2
+  echo "  例:   fix(portrelay): 修复 UDP 会话键悬垂引用" >&2
+  exit 1
+fi
+
+len=$(printf '%s' "$subject" | wc -c | tr -cd '0-9')
+if [ "$len" -gt 100 ]; then
+  echo "[commit-msg] 提交信息首行过长($len 字节), 建议 <= 100" >&2
+fi
+exit 0

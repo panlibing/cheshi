@@ -1,0 +1,71 @@
+#!/bin/sh
+# ============================================================================
+# pre-commit: 提交卫生检查(轻量、无需编译器)
+#
+#   1) 暂存的 shell 脚本做 `bash -n` 语法检查;
+#   2) port_relay/README.md 里「文件名(N 行)」的行数标注必须与真实行数一致
+#      (源码改了文档没跟 -> 直接拦下);
+#   3) 若已构建 port_relay 可执行文件, 追加 README 与 `-h` 的长选项双向比对。
+#
+# 失败会阻止提交; 确需跳过用 `git commit --no-verify`。
+# 仓库已配置 core.hooksPath=.githooks, 无需再手动启用。
+# ============================================================================
+set -u
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+cd "$root" || exit 0
+
+# 这些脚本含 bash 专有语法, 用 bash 解析; 找不到 bash 则跳过脚本类检查
+BASH="$(command -v bash 2>/dev/null || true)"
+
+fail=0
+
+# --- 1) 暂存 shell 脚本语法 ------------------------------------------------
+if [ -n "$BASH" ]; then
+  for f in $(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.sh$' || true); do
+    [ -f "$f" ] || continue
+    if ! "$BASH" -n "$f" 2>/dev/null; then
+      echo "[pre-commit] shell 语法错误: $f" >&2
+      fail=1
+    fi
+  done
+fi
+
+# --- 2) README 行数标注一致性 ---------------------------------------------
+readme="port_relay/README.md"
+if [ -f "$readme" ]; then
+  tmp="$(mktemp 2>/dev/null || echo "/tmp/pr_precommit_$$")"
+  grep -oE '[A-Za-z0-9_][A-Za-z0-9_.-]*\.(cpp|hpp|h|cc|sh|ps1|bat|md|yml|txt)' "$readme" \
+    | sort -u > "$tmp"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    n_doc="$(grep -F -- "$name" "$readme" | grep -oE '[0-9]+ 行' | head -n 1 | tr -cd '0-9')"
+    [ -n "$n_doc" ] || continue
+    file=""
+    for cand in "port_relay/$name" "port_relay/tests/$name"; do
+      if [ -f "$cand" ]; then file="$cand"; break; fi
+    done
+    [ -n "$file" ] || continue
+    n_real="$(wc -l < "$file" | tr -cd '0-9')"
+    if [ "$n_doc" != "$n_real" ]; then
+      echo "[pre-commit] README 行数标注漂移: $name 标注 $n_doc 行, 实际 $n_real 行" >&2
+      fail=1
+    fi
+  done < "$tmp"
+  rm -f "$tmp"
+fi
+
+# --- 3) README 与 -h 选项比对(仅当二进制已构建且 bash 可用) -----------------
+relay="port_relay/portrelay"
+[ -x "$relay" ] || relay="port_relay/portrelay.exe"
+if [ -n "$BASH" ] && [ -x "$relay" ] && [ -f "port_relay/tests/check_docs_sync.sh" ]; then
+  if ! "$BASH" "port_relay/tests/check_docs_sync.sh" "$relay" >/dev/null 2>&1; then
+    echo "[pre-commit] README 与 -h 选项不一致, 运行: bash port_relay/tests/check_docs_sync.sh" >&2
+    fail=1
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "[pre-commit] 检查未通过, 提交已阻止(可用 git commit --no-verify 跳过)" >&2
+fi
+exit "$fail"

@@ -14,6 +14,8 @@
 *.yaml        text eol=lf
 Makefile      text eol=lf
 build.sh      text eol=lf
+# git 钩子必须 LF: 否则 shebang 行尾带 \r, 在 Linux/macOS 上无法执行
+.githooks/**  text eol=lf
 
 # Windows 脚本: 强制 CRLF
 *.bat         text eol=crlf
