@@ -135,7 +135,7 @@ try {
   Check 'help exit code 0' ($LASTEXITCODE -eq 0)
   Check 'help shows options' ($out -match '--rule')
   $out = (& $relay -V 2>&1 | Out-String)
-  Check 'version 1.1.0' ($out -match '1\.1\.0')
+  Check 'version 1.2.0' ($out -match '1\.2\.0')
   $out = (& $relay --badopt 2>&1 | Out-String)
   Check 'unknown option rejected' (($LASTEXITCODE -ne 0) -and ($out -match 'badopt'))
   $out = (& $relay -M tcp -l 9000 -t 10.0.0.1 2>&1 | Out-String)

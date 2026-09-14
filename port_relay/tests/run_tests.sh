@@ -11,6 +11,7 @@
 #   C) 无参启动自动加载 exe 同目录 portrelay.conf
 #   D) -h / -V 输出; 非法参数必须被拒绝
 #   E) README.md 与 -h 的选项集合双向同步检查(防止文档再次漂移)
+#   F) 单元测试: 纯函数(解析/校验/规范化) + 配置解析 fuzz(tests/unit_tests.cpp)
 #
 # 用法:
 #   bash tests/run_tests.sh          # 退出码 0 = 全过, 1 = 有失败
@@ -24,6 +25,7 @@ CXX="${CXX:-g++}"
 RELAY="$ROOT/portrelay"
 ECHO="$TESTS/echo"
 PROBE="$TESTS/probe"
+UNIT="$TESTS/unit_tests"
 README="$ROOT/README.md"
 
 TMP="$(mktemp -d)"
@@ -98,6 +100,14 @@ build_all() {
     say '-- 构建 tests/probe'
     "$CXX" -std=c++17 -O2 -Wall -Wextra -pthread -o "$PROBE" "$TESTS/probe.cpp" \
       || { say '[FAIL] probe 构建失败'; exit 1; }
+  fi
+  if [ ! -x "$UNIT" ]; then
+    say '-- 构建 tests/unit_tests'
+    # -Wno-unused-function: unit_tests.cpp 通过 #include 复用主文件, 主文件里
+    # 未被本测试用到的 static 函数会触发 unused-function, 这里显式豁免。
+    "$CXX" -std=c++17 -O2 -Wall -Wextra -Wno-unused-function -pthread \
+      -o "$UNIT" "$TESTS/unit_tests.cpp" \
+      || { say '[FAIL] unit_tests 构建失败'; exit 1; }
   fi
 }
 
@@ -228,6 +238,15 @@ if sync_out="$("$TESTS/check_docs_sync.sh" "$RELAY" 2>&1)"; then
 else
   bad 'README 与 -h 长选项不一致'
   printf '%s\n' "$sync_out" | sed 's/^/       /'
+fi
+
+# ---------------------------------------------------------------------------
+hdr 'F) 单元测试: 纯函数 + 配置解析 fuzz (tests/unit_tests)'
+if unit_out="$("$UNIT" 2>&1)"; then
+  ok "单元测试全部通过 ($(printf '%s\n' "$unit_out" | grep -c '^==') 段输出)"
+else
+  bad '单元测试失败'
+  printf '%s\n' "$unit_out" | sed 's/^/       /'
 fi
 
 # ---------------------------------------------------------------------------

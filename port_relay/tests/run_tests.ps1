@@ -78,6 +78,17 @@ try {
   } catch { Write-Host "[FAIL] UDP client exception: $_" -ForegroundColor Red; $allPass = $false }
   finally { if ($u) { $u.Close() } }
 
+  # ---------------- unit tests ----------------
+  Write-Host '== unit tests: pure functions + config-parsing fuzz ==' -ForegroundColor Cyan
+  $unit = Join-Path $PSScriptRoot 'unit_tests.exe'
+  if (Test-Path $unit) {
+    & $unit
+    if ($LASTEXITCODE -ne 0) { $allPass = $false }
+  } else {
+    Write-Host '[FAIL] unit_tests.exe missing - build it via tests\build.bat' -ForegroundColor Red
+    $allPass = $false
+  }
+
   # ---------------- summary ----------------
   if ($allPass) {
     Write-Host '== ALL TESTS PASSED ==' -ForegroundColor Green

@@ -10,7 +10,9 @@
   #define WIN32_LEAN_AND_MEAN
   #include <winsock2.h>
   #include <ws2tcpip.h>
-  #pragma comment(lib, "ws2_32.lib")
+  #if defined(_MSC_VER)
+    #pragma comment(lib, "ws2_32.lib")  // MSVC 自动链接; MinGW(g++) 用 -lws2_32
+  #endif
   using sock_t = SOCKET;
   const sock_t kInvalid = INVALID_SOCKET;
   inline void closesock(sock_t s) { closesocket(s); }

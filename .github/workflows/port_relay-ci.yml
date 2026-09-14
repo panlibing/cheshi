@@ -17,11 +17,11 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Linux: g++ / clang++ 双编译器, 直接跑仓库自带的 build.sh / run_tests.sh /
-  #        check_docs_sync.sh (不重复手写编译命令, 脚本就是唯一事实来源)
+  # Linux: g++ / clang++ 双编译器, -Werror 严格编译, 直接跑仓库自带的
+  #        build.sh / run_tests.sh / check_docs_sync.sh(不重复手写编译命令)
   # ---------------------------------------------------------------------------
   linux-build-test:
-    name: Linux 构建 + 端到端自测 (${{ matrix.cxx }})
+    name: Linux 构建 + 端到端自测 (${{ matrix.cxx }}, -Werror)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -29,6 +29,7 @@ jobs:
         cxx: [g++, clang++]
     env:
       CXX: ${{ matrix.cxx }}
+      WERROR: '1'                       # 告警即失败(CI 门禁)
 
     steps:
       - name: 检出代码
@@ -46,7 +47,7 @@ jobs:
             bash -n "$f" && echo "  - $f 语法 OK"
           done
 
-      - name: 构建 portrelay (bash build.sh)
+      - name: 构建 portrelay (bash build.sh, -Werror)
         working-directory: port_relay
         run: bash build.sh
 
@@ -54,23 +55,24 @@ jobs:
         working-directory: port_relay
         run: bash tests/check_docs_sync.sh
 
-      - name: 端到端自测 (tests/run_tests.sh: 内含构建 + A~E 全部分段)
+      - name: 端到端自测 (tests/run_tests.sh: 内含构建 + A~F 全部分段)
         working-directory: port_relay
         run: bash tests/run_tests.sh
 
       - name: 失败时打印产物信息
         if: failure()
         working-directory: port_relay
-        run: ls -l portrelay tests/echo tests/probe 2>/dev/null || true
+        run: ls -l portrelay tests/echo tests/probe tests/unit_tests 2>/dev/null || true
 
   # ---------------------------------------------------------------------------
-  # macOS: clang++, 同样跑仓库脚本(此前 CI 里根本没有 macOS 任务)
+  # macOS: clang++, 同样跑仓库脚本 + -Werror
   # ---------------------------------------------------------------------------
   macos-build-test:
-    name: macOS 构建 + 端到端自测 (clang++)
+    name: macOS 构建 + 端到端自测 (clang++, -Werror)
     runs-on: macos-latest
     env:
       CXX: clang++
+      WERROR: '1'
 
     steps:
       - name: 检出代码
@@ -88,7 +90,7 @@ jobs:
             bash -n "$f" && echo "  - $f 语法 OK"
           done
 
-      - name: 构建 portrelay (bash build.sh)
+      - name: 构建 portrelay (bash build.sh, -Werror)
         working-directory: port_relay
         run: bash build.sh
 
@@ -96,14 +98,45 @@ jobs:
         working-directory: port_relay
         run: bash tests/check_docs_sync.sh
 
-      - name: 端到端自测 (tests/run_tests.sh: 内含构建 + A~E 全部分段)
+      - name: 端到端自测 (tests/run_tests.sh: 内含构建 + A~F 全部分段)
         working-directory: port_relay
         run: bash tests/run_tests.sh
 
       - name: 失败时打印产物信息
         if: failure()
         working-directory: port_relay
-        run: ls -l portrelay tests/echo tests/probe 2>/dev/null || true
+        run: ls -l portrelay tests/echo tests/probe tests/unit_tests 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # Sanitizers: AddressSanitizer + UndefinedBehaviorSanitizer 全量跑端到端自测,
+  #             抓内存越界 / 释放后使用 / 未定义行为(含单元测试的解析 fuzz)。
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: Sanitizers ASan+UBSan (g++)
+    runs-on: ubuntu-latest
+    env:
+      CXX: g++
+      WERROR: '1'
+      SANITIZE: '1'
+      FORCE_BUILD: '1'
+      ASAN_OPTIONS: 'detect_leaks=1:abort_on_error=1:strict_string_checks=1'
+      UBSAN_OPTIONS: 'halt_on_error=1:print_stacktrace=1'
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 工具链版本
+        run: $CXX --version | head -n 1
+
+      - name: 构建(ASan+UBSan) + 端到端自测 (bash tests/run_tests.sh)
+        working-directory: port_relay
+        run: bash tests/run_tests.sh
+
+      - name: 失败时打印产物信息
+        if: failure()
+        working-directory: port_relay
+        run: ls -l portrelay tests/echo tests/probe tests/unit_tests 2>/dev/null || true
 
   # ---------------------------------------------------------------------------
   # Windows: MSVC(build.bat 自动定位 VS 环境) + 两个 PowerShell 自测脚本
@@ -122,7 +155,7 @@ jobs:
         shell: cmd
         run: build.bat
 
-      - name: 构建 tests\echo.exe (tests\build.bat, MSVC)
+      - name: 构建 tests 辅助程序 (echo/probe/unit_tests, MSVC)
         working-directory: port_relay\tests
         shell: cmd
         run: build.bat
@@ -140,7 +173,7 @@ jobs:
         shell: bash
         run: bash tests/check_docs_sync.sh portrelay.exe
 
-      - name: Windows 端到端自测 (tests/run_tests.ps1)
+      - name: Windows 端到端自测 (tests/run_tests.ps1: 含单元测试)
         working-directory: port_relay
         shell: pwsh
         run: ./tests/run_tests.ps1
@@ -154,4 +187,4 @@ jobs:
         if: failure()
         working-directory: port_relay
         shell: bash
-        run: ls -l portrelay.exe tests/echo.exe 2>/dev/null || true
+        run: ls -l portrelay.exe tests/echo.exe tests/probe.exe tests/unit_tests.exe 2>/dev/null || true

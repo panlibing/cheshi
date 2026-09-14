@@ -43,7 +43,22 @@ call "!VCVARS!" >nul
 :compile
 cl /nologo /O2 /std:c++17 /EHsc /utf-8 /W3 echo.cpp ws2_32.lib /Fe:echo.exe
 if errorlevel 1 (
-  echo [ERROR] build failed
+  echo [ERROR] build echo.exe failed
   exit /b 1
 )
 echo [OK] generated echo.exe
+
+cl /nologo /O2 /std:c++17 /EHsc /utf-8 /W3 probe.cpp ws2_32.lib /Fe:probe.exe
+if errorlevel 1 (
+  echo [ERROR] build probe.exe failed
+  exit /b 1
+)
+echo [OK] generated probe.exe
+
+rem unit_tests.cpp 通过 #include 复用主源码(PORTRELAY_NO_MAIN), MSVC 下无需额外豁免
+cl /nologo /O2 /std:c++17 /EHsc /utf-8 /W3 unit_tests.cpp ws2_32.lib /Fe:unit_tests.exe
+if errorlevel 1 (
+  echo [ERROR] build unit_tests.exe failed
+  exit /b 1
+)
+echo [OK] generated unit_tests.exe
